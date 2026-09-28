@@ -9,7 +9,9 @@ import type { Config as PluginConfig, Report, Scope, Status } from './types'
 export const name = 'cnb-bot'
 export const inject = ['database']
 
-export const Config: any = Schema.object({
+export type Config = PluginConfig
+
+export const Config: Schema<Config> = Schema.object({
   group_whitelist: Schema.array(Schema.string()).default([]).description('允许使用报障功能的群号；留空时所有群均不启用。'),
   private_whitelist: Schema.array(Schema.string()).default([]).description('私信用户白名单；留空时允许所有用户。'),
   reply_in_disabled_groups: Schema.boolean().default(false).description('在未启用的群里回复提示。'),
@@ -118,7 +120,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       rows.push(`分析请求已提交，预计等待不超过 ${formatDuration(task.analysis_deadline - task.trigger_at)}。`)
     } else if (task.status === 'AWAITING_RECOVERY') {
       rows.push(`分析结论：${task.analysis_summary || '详见 Issue。'}`)
-      rows.push('/debug resolve 确认已解决，或补充信息后发送 /debug analyze。')
+      rows.push('debug resolve 确认已解决，或补充信息后发送 debug analyze。')
     } else if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'issue_creation') {
       rows.push(`请管理员在 CNB 仓库搜索追踪编号 ${task.id} 核对；插件不会重复创建。`)
     } else if (task.last_error) {
@@ -276,7 +278,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         if (ambiguous(error)) {
           const uncertain = await setUncertain(await store.get(id) || task, 'trigger_comment', '正在核对分析请求是否已提交。')
           await fs.rm(path, { force: true }).catch(() => {})
-          return `${config.assistant_name}的分析请求提交结果不确定，正在核对，请稍后发送 /debug status。\nIssue：${task.issue_url}`
+          return `${config.assistant_name}的分析请求提交结果不确定，正在核对，请稍后发送 debug status。\nIssue：${task.issue_url}`
         }
         const failed = await failTask(
           task,
@@ -342,7 +344,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       }
       const latest = await store.get(task.id)
       const suffix = latest?.status === 'WAITING_LOG'
-        ? `\n请在 ${formatDuration(latest.deadline - now())}内重新上传，或发送 /debug cancel 取消报障。`
+        ? `\n请在 ${formatDuration(latest.deadline - now())}内重新上传，或发送 debug cancel 取消报障。`
         : ''
       await session.send(`${errorText(error)}${suffix}`)
     }
@@ -363,13 +365,13 @@ export function apply(ctx: Context, input: PluginConfig) {
       return `补充信息提交失败：${errorText(error)}`
     }
     return task.status === 'WAITING_NPC' || task.status === 'AWAITING_RECOVERY'
-      ? `已补充到 Issue。\n补充完后发送 /debug analyze，让${config.assistant_name}结合新信息重新分析。`
+      ? `已补充到 Issue。\n补充完后发送 debug analyze，让${config.assistant_name}结合新信息重新分析。`
       : '已补充到 Issue。'
   }
 
   async function requestAnalysis(task: Report) {
     if (task.status !== 'AWAITING_RECOVERY' && task.status !== 'WAITING_NPC') {
-      if (task.status === 'TRIGGERING_NPC') return '分析请求正在处理，请稍后发送 /debug status 查看进度。'
+      if (task.status === 'TRIGGERING_NPC') return '分析请求正在处理，请稍后发送 debug status 查看进度。'
       if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'trigger_comment') return '正在确认上一次分析请求是否已提交，请稍后再试。'
       return `当前状态为“${STATUS_LABELS[task.status]}”，暂时不能重新分析。`
     }
@@ -530,7 +532,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         return
       }
       try {
-        await withTimeout(index === 0
+        await withTimeout<unknown>(index === 0
           ? sendForward(task, parts[index])
           : sendTask(task, task.direct ? parts[index] : [h('at', { id: task.user_id }), ' ', parts[index]]), seconds(config.delivery_send_timeout_seconds, 30, 1, 300) * 1000)
         const updated = await store.update(task.id, {
@@ -571,7 +573,7 @@ export function apply(ctx: Context, input: PluginConfig) {
 
   function recoveryPrompt(task: Report) {
     const how = task.direct ? '直接私信我' : '@我'
-    return `结论：${task.analysis_summary || '已返回分析，详见上方。'}\n\n问题解决了吗？\n· 已解决：发送 /debug resolve\n· 没解决：${how}补充现象，再发送 /debug analyze 重新分析`
+    return `结论：${task.analysis_summary || '已返回分析，详见上方。'}\n\n问题解决了吗？\n· 已解决：发送 debug resolve\n· 没解决：${how}补充现象，再发送 debug analyze 重新分析`
   }
 
   async function finish(task: Report, status: Status, message: string, extra: Record<string, any> = {}, expected: Status[] = [task.status]) {
@@ -596,7 +598,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         last_error: '',
       }, 'AWAITING_RECOVERY', false, ['WAITING_NPC', 'UNCERTAIN'])
       if (restored?.status === 'AWAITING_RECOVERY') {
-        await notify(restored, `本轮重新分析未获得可验证结果，已恢复原报障状态，原分析结论仍可查看。稍后可再次发送 /debug analyze。\nIssue：${restored.issue_url}`, !restored.direct)
+        await notify(restored, `本轮重新分析未获得可验证结果，已恢复原报障状态，原分析结论仍可查看。稍后可再次发送 debug analyze。\nIssue：${restored.issue_url}`, !restored.direct)
         return restored
       }
       return restored
@@ -618,13 +620,13 @@ export function apply(ctx: Context, input: PluginConfig) {
       return `当前状态为“${STATUS_LABELS[task.status]}”，暂时不能确认解决。`
     }
     const closing = await store.update(task.id, { next_issue_close_at: now() }, 'CLOSING_ISSUE', false, ['AWAITING_RECOVERY', 'CLOSING_ISSUE']) || task
-    if (closing.status !== 'CLOSING_ISSUE') return '报障状态已变化，请发送 /debug status 查看进度。'
+    if (closing.status !== 'CLOSING_ISSUE') return '报障状态已变化，请发送 debug status 查看进度。'
     try {
       const client = clientFor(String(task.repository || config.cnb_repository))
       const issue = await client.getIssue(String(task.issue_number))
       if (String(issue.state || '').toLowerCase() !== 'closed') await client.closeIssue(String(task.issue_number))
       const done = await store.update(task.id, { issue_state: 'closed', closed_by_user: true }, 'DONE', true, ['CLOSING_ISSUE'])
-      if (done?.status !== 'DONE') return '报障状态已变化，请发送 /debug status 查看进度。'
+      if (done?.status !== 'DONE') return '报障状态已变化，请发送 debug status 查看进度。'
       if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
       if (announce) await notify(closing, '已确认解决，报障结束，Issue 已关闭。感谢反馈！', !task.direct)
       return '已确认解决，报障结束，Issue 已关闭。感谢反馈！'
@@ -715,7 +717,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         try {
           const time = now()
           if (task.status === 'WAITING_LOG' && task.deadline <= time) {
-            await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 /debug。', {}, ['WAITING_LOG'])
+            await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 debug。', {}, ['WAITING_LOG'])
           } else if (task.status === 'WAITING_NPC') {
             if (Number(task.analysis_deadline || 0) <= time) {
               await analysisTimedOut(task)
@@ -761,7 +763,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     }
     for (const task of activeTasks) {
       if (task.status === 'WAITING_LOG' && task.deadline <= now()) {
-        await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 /debug。', {}, ['WAITING_LOG'])
+        await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 debug。', {}, ['WAITING_LOG'])
       } else if (task.status === 'PREPARING_LOG') {
         const prepared = String(task.prepared_path || '')
         if (prepared && await fs.stat(prepared).then(() => true, () => false)) {
@@ -816,15 +818,15 @@ export function apply(ctx: Context, input: PluginConfig) {
       if (!arg || subcommand === 'start') return await startReport(scope, arg && subcommand !== 'start' ? arg : '')
       if (subcommand === 'help') return helpText(privateChat, config.assistant_name)
       const guess = likelyTypo(arg)
-      if (!subcommand && guess) return `没有 /debug ${arg} 这个指令，你是不是想发送 /debug ${guess}？\n如果这是故障描述，请写得更具体一些，例如：/debug 启动后闪退。\n发送 /debug help 查看全部指令。`
+      if (!subcommand && guess) return `没有 debug ${arg} 这个指令，你是不是想发送 debug ${guess}？\n如果这是故障描述，请写得更具体一些，例如：debug 启动后闪退。\n发送 debug help 查看全部指令。`
       const task = await store.findCurrent(scope)
       if (subcommand === 'status') {
-        if (!task) return '你在这里还没有报障，请先发送 /debug 开始。'
+        if (!task) return '你在这里还没有报障，请先发送 debug 开始。'
         await refresh(task)
         return formatTaskStatus(await store.get(task.id) || task)
       }
       if (subcommand === 'analyze') {
-        if (!task || TERMINAL.has(task.status)) return '你在这里还没有未结束的报障，请先发送 /debug 开始。'
+        if (!task || TERMINAL.has(task.status)) return '你在这里还没有未结束的报障，请先发送 debug 开始。'
         return requestAnalysis(task)
       }
       if (subcommand === 'resolve') {
@@ -843,7 +845,7 @@ export function apply(ctx: Context, input: PluginConfig) {
           { last_error: '', prepared_path: '', delivery_parts: [], analysis_body: '' },
           true,
         )
-        if (!latest) return '报障状态已变化，请发送 /debug status 查看进度。'
+        if (!latest) return '报障状态已变化，请发送 debug status 查看进度。'
         if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
         if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'issue_creation') {
           return `报障已取消，但无法确认 Issue 是否已创建。请管理员在 CNB 仓库搜索追踪编号 ${task.id} 核对。`
@@ -859,7 +861,7 @@ export function apply(ctx: Context, input: PluginConfig) {
   async function startReport(scope: Scope, issueTitle = ''): Promise<string> {
     const existing = await store.findActive(scope)
     if (existing) {
-      return `你在这里已有一个未结束的报障（${statusLabel(existing)}）。\n发送 /debug status 查看进度，或 /debug cancel 取消后重新开始。`
+      return `你在这里已有一个未结束的报障（${statusLabel(existing)}）。\n发送 debug status 查看进度，或 debug cancel 取消后重新开始。`
     }
     const missing = []
     if (!config.cnb_repository.trim()) missing.push('目标 CNB 仓库')
@@ -891,7 +893,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     if (!created) {
       const conflict = await store.findActive(scope)
       return conflict
-        ? `你在这里已有一个未结束的报障（${statusLabel(conflict)}）。\n发送 /debug status 查看进度，或 /debug cancel 取消后重新开始。`
+        ? `你在这里已有一个未结束的报障（${statusLabel(conflict)}）。\n发送 debug status 查看进度，或 debug cancel 取消后重新开始。`
         : '无法创建报障记录，请稍后重试或联系管理员。'
     }
     const ttl = formatDuration(task.deadline - now())
@@ -900,13 +902,13 @@ export function apply(ctx: Context, input: PluginConfig) {
     if (task.issue_title) rows.push(`Issue 标题：${task.issue_title}`)
     rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可${scope.direct ? '直接私信' : '@我'}补充信息。`)
     rows.push('注意：文件会原样提交到 CNB 仓库，不会读取或脱敏，请确认不含隐私内容。')
-    rows.push('/debug cancel 取消 · /debug help 查看帮助')
+    rows.push('debug cancel 取消 · debug help 查看帮助')
     return rows.join('\n')
   }
 
   async function refresh(task: Report) {
     if (task.status === 'WAITING_LOG' && task.deadline <= now()) {
-      await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 /debug。', {}, ['WAITING_LOG'])
+      await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 debug。', {}, ['WAITING_LOG'])
     } else if (task.status === 'WAITING_NPC') await pollNPC(task)
     else if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'trigger_comment') await reconcileTrigger(task)
     else if (task.status === 'AWAITING_RECOVERY') await syncIssue(task)
@@ -925,7 +927,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         if (users.size && !users.has(scope.user_id)) return
       } else if (!configValues(config.group_whitelist).has(scope.guild_id)) return
 
-      const files = session.elements.filter(element => element.type === 'file') as any[]
+      const files = (session.elements || []).filter(element => element.type === 'file') as any[]
       if (files.length) {
         const waiting = await store.findWaiting(scope)
         if (!waiting) return
@@ -986,14 +988,14 @@ function getScope(session: Session): Scope | undefined {
 }
 
 function plainText(session: Session) {
-  const parts = session.elements.filter(element => element.type === 'text')
+  const parts = (session.elements || []).filter(element => element.type === 'text')
     .map(element => String((element as any).attrs?.content ?? (element as any).attrs?.text ?? ''))
   return parts.length ? parts.join('') : String(session.content || '')
 }
 
 function mentionsBot(session: Session) {
   const botId = String(session.selfId || '')
-  return session.elements.some(element => element.type === 'at'
+  return (session.elements || []).some(element => element.type === 'at'
     && String((element as any).attrs?.id || (element as any).attrs?.qq || '') === botId)
 }
 
@@ -1009,11 +1011,11 @@ function helpText(privateChat: boolean, assistantName: string) {
   const how = privateChat ? '直接私信我' : '@我'
   return [
     '报障指令：',
-    '/debug [故障描述] 开始报障，描述会作为 Issue 标题',
-    '/debug status 查看进度',
-    `/debug analyze 补充信息后请${assistantName}重新分析`,
-    '/debug resolve 确认问题已解决',
-    '/debug cancel 取消报障',
+    'debug [故障描述] 开始报障，描述会作为 Issue 标题',
+    'debug status 查看进度',
+    `debug analyze 补充信息后请${assistantName}重新分析`,
+    'debug resolve 确认问题已解决',
+    'debug cancel 取消报障',
     `Issue 创建后，${how}发送文字即可补充到 Issue。`,
   ].join('\n')
 }
@@ -1025,7 +1027,7 @@ function statusLabel(task: Report) {
 }
 
 function submittedNotice(task: Report) {
-  return `日志已提交，${task.assistant_name || '分析助手'}正在分析，通常需要几分钟（最长 ${formatDuration(Number(task.analysis_deadline || now()) - Number(task.trigger_at || now()))}）。\nIssue：${task.issue_url}\n可发送 /debug status 查看进度。`
+  return `日志已提交，${task.assistant_name || '分析助手'}正在分析，通常需要几分钟（最长 ${formatDuration(Number(task.analysis_deadline || now()) - Number(task.trigger_at || now()))}）。\nIssue：${task.issue_url}\n可发送 debug status 查看进度。`
 }
 
 function formatAnalysis(body: string) {

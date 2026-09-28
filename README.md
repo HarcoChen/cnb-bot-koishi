@@ -1,12 +1,18 @@
 # Koishi CNB 报障助手
 
-Koishi 插件版 CNB 报障助手。用户发送 `/debug [故障描述]` 后上传一个 `.zip` 或 `.log` 文件；插件把原始文件上传到 CNB、创建 Issue、请求配置好的 NPC 分析，并把已验证的分析结果发回会话。
+Koishi 插件版 CNB 报障助手。用户发送 `debug [故障描述]` 后上传一个 `.zip` 或 `.log` 文件；插件把原始文件上传到 CNB、创建 Issue、请求配置好的 NPC 分析，并把已验证的分析结果发回会话。
 
 ## 安装
 
-需要 Node.js 18 或更高版本。在 Koishi 项目目录运行 `npm install ../cnb-bot-koishi`（按本机目录调整路径），然后在 Koishi 配置中加载 `koishi-plugin-cnb-bot`。确保已经启用数据库服务（例如 `@koishijs/plugin-database-sqlite`），并确认 Koishi 的指令前缀允许用户发送 `/debug`。
+需要 Node.js 18 或更高版本。在 Koishi 项目目录运行 `npm install ../cnb-bot-koishi`（按本机目录调整路径），然后在 Koishi 配置中加载 `koishi-plugin-cnb-bot`。确保已经启用数据库服务（例如 `@koishijs/plugin-database-sqlite`），默认无需指令前缀，直接发送 `debug`；如果自定义了 Koishi 的全局指令前缀，请按实际配置调用。
 
 本插件需要 Koishi v4 和支持文件消息的聊天适配器。QQ OneBot 用户需要确认适配器能接收群文件/文件消息，并支持合并转发；不支持合并转发的平台会收到普通文本结果。
+
+### Docker 挂载安装
+
+挂载源码目录并通过 `portal:` 安装时，需要先在插件目录执行 `npm install` 和 `npm run build`，确保挂载目录包含 `lib/index.js`。`package.json` 的入口指向这个构建文件，Koishi 不会直接加载 `src/index.ts`。安装依赖时请使用与容器兼容的 Node.js 环境。
+
+如果控制台提示“此插件未声明配置项”，请先确认容器中实际加载的入口存在且导出了 `Config`；加载失败也可能出现这一提示。本插件已声明配置 Schema。补齐构建产物后，重载 Koishi 应用（或重启 Koishi 容器），让控制台重新读取插件配置。
 
 ## 配置
 
@@ -35,12 +41,12 @@ Koishi 插件版 CNB 报障助手。用户发送 `/debug [故障描述]` 后上�
 
 | 指令 | 作用 |
 | --- | --- |
-| `/debug [描述]` | 开始报障，描述作为 Issue 标题 |
-| `/debug status` | 查看当前报障进度 |
-| `/debug analyze` | 补充信息后请求 NPC 重新分析 |
-| `/debug resolve` | 确认问题已解决并关闭 Issue |
-| `/debug cancel` | 取消当前报障；已创建的 Issue 保留 |
-| `/debug help` | 查看指令说明 |
+| `debug [描述]` | 开始报障，描述作为 Issue 标题 |
+| `debug status` | 查看当前报障进度 |
+| `debug analyze` | 补充信息后请求 NPC 重新分析 |
+| `debug resolve` | 确认问题已解决并关闭 Issue |
+| `debug cancel` | 取消当前报障；已创建的 Issue 保留 |
+| `debug help` | 查看指令说明 |
 
 Issue 创建后，在群里 @机器人并附上文字，或在私信中直接发送文字，可以把补充说明写入 Issue 评论。每个用户在同一个群或私信会话中同时只能有一个未结束的报障。
 

@@ -97,7 +97,7 @@ export class ReportStore {
       await this.db.create(TABLE, this.encode(task))
       return true
     } catch (error) {
-      // The unique active_key index arbitrates simultaneous /debug requests.
+      // The unique active_key index arbitrates simultaneous debug requests.
       return false
     }
   }
@@ -180,7 +180,9 @@ export class ReportStore {
 
       const query: Record<string, any> = { id, revision }
       if (expected) query.status = { $in: expected }
-      const result = await this.db.set(TABLE, query, this.encode(next))
+      // Minato forbids including a primary key in an update, even unchanged.
+      const { id: _id, ...update } = this.encode(next)
+      const result = await this.db.set(TABLE, query, update)
       if (result?.matched) return { task: await this.get(id), applied: true }
 
       // A concurrent write changed the record after the read. Retry ordinary
