@@ -38,6 +38,10 @@
     "node": ">=18.0.0"
   },
   "koishi": {
+    "description": {
+      "zh": "将诊断日志提交到 CNB Issue，并转发 NPC 分析结果。",
+      "en": "Submit diagnostic logs to CNB Issues and relay NPC analysis."
+    },
     "service": {
       "required": ["database"]
     }
