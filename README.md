@@ -1,18 +1,15 @@
 # Koishi CNB 报障助手
 
+[![npm version](https://img.shields.io/npm/v/koishi-plugin-cnb-bot)](https://www.npmjs.com/package/koishi-plugin-cnb-bot)
+[![npm downloads](https://img.shields.io/npm/dm/koishi-plugin-cnb-bot)](https://www.npmjs.com/package/koishi-plugin-cnb-bot)
+[![Koishi v4](https://img.shields.io/badge/Koishi-%5E4.18.0-514997)](https://koishi.chat/)
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Koishi 插件版 CNB 报障助手。用户发送 `debug [故障描述]` 后上传一个 `.zip` 或 `.log` 文件；插件把原始文件上传到 CNB、创建 Issue、请求配置好的 NPC 分析，并把已验证的分析结果发回会话。
 
-## 安装
 
-需要 Node.js 18 或更高版本。在 Koishi 项目目录运行 `npm install ../cnb-bot-koishi`（按本机目录调整路径），然后在 Koishi 配置中加载 `koishi-plugin-cnb-bot`。确保已经启用数据库服务（例如 `@koishijs/plugin-database-sqlite`），默认无需指令前缀，直接发送 `debug`；如果自定义了 Koishi 的全局指令前缀，请按实际配置调用。
-
-本插件需要 Koishi v4 和支持文件消息的聊天适配器。QQ OneBot 用户需要确认适配器能接收群文件/文件消息，并支持合并转发；不支持合并转发的平台会收到普通文本结果。
-
-### Docker 挂载安装
-
-挂载源码目录并通过 `portal:` 安装时，需要先在插件目录执行 `npm install` 和 `npm run build`，确保挂载目录包含 `lib/index.js`。`package.json` 的入口指向这个构建文件，Koishi 不会直接加载 `src/index.ts`。安装依赖时请使用与容器兼容的 Node.js 环境。
-
-如果控制台提示“此插件未声明配置项”，请先确认容器中实际加载的入口存在且导出了 `Config`；加载失败也可能出现这一提示。本插件已声明配置 Schema。补齐构建产物后，重载 Koishi 应用（或重启 Koishi 容器），让控制台重新读取插件配置。
+- [AstrBot CNB 报障助手](https://github.com/HarcoChen/astrbot_plugin_cnb_bot)：适用于 AstrBot 的日志提交与 CNB 分析插件。
 
 ## 配置
 
@@ -57,10 +54,3 @@ Issue 创建后，在群里 @机器人并附上文字，或在私信中直接发
 日志下载仅接受 `.zip` 和 `.log`，受大小上限约束。HTTP(S) 下载会检查每次重定向、域名白名单和解析到的 IP 地址，拒绝本机、内网及保留地址。临时文件存放在 Koishi 项目目录下的 `data/koishi-plugin-cnb-bot/`，成功上传或报障结束后会删除。
 
 报障状态存储在 Koishi 配置的数据库中，其中包括平台、机器人、群/频道、用户、Issue 编号和处理状态。插件不读取群聊历史；只有发起报障后用户主动提交的描述、日志附件和补充文字会进入 CNB。插件重启后会恢复未完成的流程。CNB Issue 创建请求若因连接中断而无法确认，插件会暂停并提示管理员按追踪编号核对，避免重复创建。
-
-## 开发
-
-```sh
-npm install
-npm run build
-```

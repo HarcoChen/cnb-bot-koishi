@@ -3,3 +3,4 @@ lib/
 data/
 *.tsbuildinfo
 *.zip
+*.tgz

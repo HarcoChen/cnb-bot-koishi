@@ -1,0 +1,44 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Use npm with trusted publishing support
+        run: npm install --global npm@11
+      - name: Install dependencies and build
+        run: npm ci
+      - name: Verify version and pack plugin
+        id: pack
+        run: npm run pack:check
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+      - name: Publish with npm trusted publishing
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          DIST_TAG: ${{ steps.pack.outputs.dist-tag }}
+        run: npm publish "./$TARBALL" --access public --tag "$DIST_TAG"
