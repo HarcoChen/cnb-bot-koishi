@@ -278,21 +278,27 @@ export function apply(ctx: Context, input: PluginConfig) {
           await fs.rm(path, { force: true }).catch(() => {})
           return `${config.assistant_name}的分析请求提交结果不确定，正在核对，请稍后发送 /debug status。\nIssue：${task.issue_url}`
         }
-        const failed = await failTask(task, `Issue 已创建，但触发分析失败：${errorText(error)}\nIssue：${task.issue_url}`)
+        const failed = await failTask(
+          task,
+          `Issue 已创建，但触发分析失败：${errorText(error)}\nIssue：${task.issue_url}`,
+          ['TRIGGERING_NPC'],
+        )
         await fs.rm(path, { force: true }).catch(() => {})
-        return failed.last_error
+        return failed.last_error || 'Issue 已创建，但触发分析失败；请查看 Issue 并联系管理员。'
       }
     })
   }
 
-  async function failTask(task: Report, message: string) {
-    const updated = await store.update(task.id, {
+  async function failTask(task: Report, message: string, expected: Status[] = ['CREATING_ISSUE']) {
+    const updated = await store.transition(task.id, 'FAILED', expected, {
       last_error: message,
       prepared_path: '',
       delivery_parts: [],
-    }, 'FAILED', true, ['CREATING_ISSUE'])
+    }, true)
     if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
-    return updated || { ...task, status: 'FAILED' as Status, last_error: message }
+    if (updated) return updated
+    const latest = await store.get(task.id)
+    return { ...(latest || task), last_error: latest?.last_error || message }
   }
 
   async function processAttachment(session: Session, scope: Scope, file: any, task: Report) {
@@ -473,14 +479,20 @@ export function apply(ctx: Context, input: PluginConfig) {
       const formatted = formatAnalysis(raw)
       const summary = analysisSummary(raw)
       const parts = [`Issue：${task.issue_url}\n\n${formatted}`, recoveryPrompt(task)]
-      const transitioned = await store.update(task.id, {
-        analysis_comment_id: String(comment.id || ''),
-        analysis_summary: summary,
-        delivery_parts: parts,
-        delivery_next_part: 0,
-        delivery_attempts: 0,
-        next_delivery_at: now(),
-      }, 'DELIVERING', false, ['WAITING_NPC'])
+      const transitioned = await store.transitionAtRevision(
+        task.id,
+        'DELIVERING',
+        ['WAITING_NPC'],
+        Number(task.revision || 0),
+        {
+          analysis_comment_id: String(comment.id || ''),
+          analysis_summary: summary,
+          delivery_parts: parts,
+          delivery_next_part: 0,
+          delivery_attempts: 0,
+          next_delivery_at: now(),
+        },
+      )
       if (transitioned?.status === 'DELIVERING') await deliver(transitioned)
     } catch (error) {
       if (error instanceof CNBAPIError || error instanceof CNBNetworkError) {
@@ -507,37 +519,41 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function deliver(task: Report) {
-    if (task.status !== 'DELIVERING') return
-    const parts: string[] = Array.isArray(task.delivery_parts) ? task.delivery_parts : []
-    const index = Number(task.delivery_next_part || 0)
-    if (index >= parts.length) {
-      await awaitRecovery(task)
-      return
-    }
-    try {
-      await withTimeout(index === 0
-        ? sendForward(task, parts[index])
-        : sendTask(task, task.direct ? parts[index] : [h('at', { id: task.user_id }), ' ', parts[index]]), seconds(config.delivery_send_timeout_seconds, 30, 1, 300) * 1000)
-      const updated = await store.update(task.id, {
-        delivery_next_part: index + 1,
-        delivery_attempts: 0,
-        next_delivery_at: now(),
-        last_delivery_error: '',
-      }, undefined, false, ['DELIVERING'])
-      if (updated && Number(updated.delivery_next_part || 0) >= parts.length) await awaitRecovery(updated)
-    } catch (error) {
-      const attempts = Number(task.delivery_attempts || 0) + 1
-      const maxAttempts = Math.max(1, Math.min(100, Number(config.max_delivery_attempts) || 10))
-      if (attempts >= maxAttempts) {
-        await finish(task, 'FAILED', `${config.assistant_name}的分析结果发送失败，请直接查看 Issue：${task.issue_url}`, {}, ['DELIVERING'])
+    return lock(task.id, async () => {
+      const current = await store.get(task.id)
+      if (!current || current.status !== 'DELIVERING') return
+      task = current
+      const parts: string[] = Array.isArray(task.delivery_parts) ? task.delivery_parts : []
+      const index = Number(task.delivery_next_part || 0)
+      if (index >= parts.length) {
+        await awaitRecovery(task)
         return
       }
-      await store.update(task.id, {
-        delivery_attempts: attempts,
-        next_delivery_at: now() + Math.min(5 * 2 ** Math.min(attempts - 1, 5), 120),
-        last_delivery_error: errorText(error),
-      }, undefined, false, ['DELIVERING'])
-    }
+      try {
+        await withTimeout(index === 0
+          ? sendForward(task, parts[index])
+          : sendTask(task, task.direct ? parts[index] : [h('at', { id: task.user_id }), ' ', parts[index]]), seconds(config.delivery_send_timeout_seconds, 30, 1, 300) * 1000)
+        const updated = await store.update(task.id, {
+          delivery_next_part: index + 1,
+          delivery_attempts: 0,
+          next_delivery_at: now(),
+          last_delivery_error: '',
+        }, undefined, false, ['DELIVERING'])
+        if (updated && Number(updated.delivery_next_part || 0) >= parts.length) await awaitRecovery(updated)
+      } catch (error) {
+        const attempts = Number(task.delivery_attempts || 0) + 1
+        const maxAttempts = Math.max(1, Math.min(100, Number(config.max_delivery_attempts) || 10))
+        if (attempts >= maxAttempts) {
+          await finish(task, 'FAILED', `${config.assistant_name}的分析结果发送失败，请直接查看 Issue：${task.issue_url}`, {}, ['DELIVERING'])
+          return
+        }
+        await store.update(task.id, {
+          delivery_attempts: attempts,
+          next_delivery_at: now() + Math.min(5 * 2 ** Math.min(attempts - 1, 5), 120),
+          last_delivery_error: errorText(error),
+        }, undefined, false, ['DELIVERING'])
+      }
+    })
   }
 
   async function awaitRecovery(task: Report) {

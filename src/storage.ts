@@ -141,12 +141,25 @@ export class ReportStore {
     return result.applied ? result.task : undefined
   }
 
+  async transitionAtRevision(
+    id: string,
+    status: Status,
+    expected: Status[],
+    revision: number,
+    patch: Record<string, any> = {},
+    releaseActive = false,
+  ): Promise<Report | undefined> {
+    const result = await this.write(id, patch, status, releaseActive, expected, revision)
+    return result.applied ? result.task : undefined
+  }
+
   private async write(
     id: string,
     patch: Record<string, any>,
     status: Status | undefined,
     releaseActive: boolean,
     expected?: Status[],
+    expectedRevision?: number,
   ): Promise<{ task?: Report; applied: boolean }> {
     for (let attempt = 0; attempt < 8; attempt++) {
       const current = await this.get(id)
@@ -157,6 +170,9 @@ export class ReportStore {
       }
 
       const revision = Number(current.revision || 0)
+      if (expectedRevision !== undefined && revision !== expectedRevision) {
+        return { task: current, applied: false }
+      }
       const next = { ...current, ...patch, status: status ?? current.status }
       if (releaseActive) next.active_key = null
       next.updated_at = Date.now() / 1000
@@ -167,10 +183,11 @@ export class ReportStore {
       const result = await this.db.set(TABLE, query, this.encode(next))
       if (result?.matched) return { task: await this.get(id), applied: true }
 
-      // A concurrent write changed the record after the read. Retry patches
-      // against the latest row, while expected-state transitions stop here.
+      // A concurrent write changed the record after the read. Retry ordinary
+      // patches against the latest row; guarded transitions stop on a mismatch.
       const latest = await this.get(id)
-      if (!latest || (expected && !expected.includes(latest.status))) {
+      if (!latest || (expected && !expected.includes(latest.status))
+        || (expectedRevision !== undefined && Number(latest.revision || 0) !== expectedRevision)) {
         return { task: latest, applied: false }
       }
     }
