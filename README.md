@@ -3,7 +3,6 @@
 [![npm version](https://img.shields.io/npm/v/koishi-plugin-cnb-bot)](https://www.npmjs.com/package/koishi-plugin-cnb-bot)
 [![npm downloads](https://img.shields.io/npm/dm/koishi-plugin-cnb-bot)](https://www.npmjs.com/package/koishi-plugin-cnb-bot)
 [![Koishi v4](https://img.shields.io/badge/Koishi-%5E4.18.0-514997)](https://koishi.chat/)
-
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Koishi 插件版 CNB 报障助手。用户发送 `debug [故障描述]` 后上传一个 `.zip` 或 `.log` 文件；插件把原始文件上传到 CNB、创建 Issue、请求配置好的 NPC 分析，并把已验证的分析结果发回会话。
