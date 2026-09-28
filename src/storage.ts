@@ -7,7 +7,7 @@ const ACTIVE = new Set<Status>([
 ])
 const INDEX_FIELDS = new Set([
   'id', 'active_key', 'status', 'platform', 'bot_id', 'guild_id', 'channel_id',
-  'user_id', 'direct', 'created_at', 'updated_at', 'deadline',
+  'user_id', 'direct', 'created_at', 'updated_at', 'deadline', 'revision',
 ])
 
 export function extendModel(ctx: any) {
@@ -24,6 +24,7 @@ export function extendModel(ctx: any) {
     created_at: 'double',
     updated_at: 'double',
     deadline: 'double',
+    revision: { type: 'unsigned', initial: 0 },
     payload: 'json',
   }, { primary: 'id', autoInc: false, unique: ['active_key'] })
 }
@@ -54,6 +55,7 @@ export class ReportStore {
       created_at: task.created_at,
       updated_at: task.updated_at,
       deadline: task.deadline,
+      revision: Number(task.revision || 0),
       payload,
     }
   }
@@ -101,12 +103,23 @@ export class ReportStore {
   }
 
   async claimLog(task: Report): Promise<boolean> {
-    const result = await this.db.set(TABLE, { id: task.id, status: 'WAITING_LOG' }, {
-      status: 'PREPARING_LOG', updated_at: Date.now() / 1000,
-    })
-    return !!result?.matched
+    return !!(await this.transition(task.id, 'PREPARING_LOG', ['WAITING_LOG']))
   }
 
+  update(
+    id: string,
+    patch?: Record<string, any>,
+    status?: undefined,
+    releaseActive?: boolean,
+    expected?: Status[],
+  ): Promise<Report | undefined>
+  update(
+    id: string,
+    patch: Record<string, any>,
+    status: Status,
+    releaseActive: boolean,
+    expected: Status[],
+  ): Promise<Report | undefined>
   async update(
     id: string,
     patch: Record<string, any> = {},
@@ -114,15 +127,54 @@ export class ReportStore {
     releaseActive = false,
     expected?: Status[],
   ): Promise<Report | undefined> {
-    const current = await this.get(id)
-    if (!current || (expected && !expected.includes(current.status))) return current
-    const next = { ...current, ...patch, status: status ?? current.status }
-    if (releaseActive) next.active_key = null
-    next.updated_at = Date.now() / 1000
-    const query: Record<string, any> = { id }
-    if (expected) query.status = { $in: expected }
-    await this.db.set(TABLE, query, this.encode(next))
-    return this.get(id)
+    return (await this.write(id, patch, status, releaseActive, expected)).task
+  }
+
+  async transition(
+    id: string,
+    status: Status,
+    expected: Status[],
+    patch: Record<string, any> = {},
+    releaseActive = false,
+  ): Promise<Report | undefined> {
+    const result = await this.write(id, patch, status, releaseActive, expected)
+    return result.applied ? result.task : undefined
+  }
+
+  private async write(
+    id: string,
+    patch: Record<string, any>,
+    status: Status | undefined,
+    releaseActive: boolean,
+    expected?: Status[],
+  ): Promise<{ task?: Report; applied: boolean }> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const current = await this.get(id)
+      if (!current) return { applied: false }
+      if (expected && !expected.includes(current.status)) return { task: current, applied: false }
+      if (status && status !== current.status && !expected) {
+        return { task: current, applied: false }
+      }
+
+      const revision = Number(current.revision || 0)
+      const next = { ...current, ...patch, status: status ?? current.status }
+      if (releaseActive) next.active_key = null
+      next.updated_at = Date.now() / 1000
+      next.revision = revision + 1
+
+      const query: Record<string, any> = { id, revision }
+      if (expected) query.status = { $in: expected }
+      const result = await this.db.set(TABLE, query, this.encode(next))
+      if (result?.matched) return { task: await this.get(id), applied: true }
+
+      // A concurrent write changed the record after the read. Retry patches
+      // against the latest row, while expected-state transitions stop here.
+      const latest = await this.get(id)
+      if (!latest || (expected && !expected.includes(latest.status))) {
+        return { task: latest, applied: false }
+      }
+    }
+    return { task: await this.get(id), applied: false }
   }
 
   async listActive(): Promise<Report[]> {

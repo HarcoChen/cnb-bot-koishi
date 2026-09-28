@@ -60,5 +60,6 @@ export interface Report {
   created_at: number
   updated_at: number
   deadline: number
+  revision?: number
   [key: string]: any
 }

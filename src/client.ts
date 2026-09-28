@@ -1,7 +1,9 @@
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs'
 import { lookup } from 'node:dns/promises'
+import { request as httpRequest, type IncomingMessage } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { extname } from 'node:path'
-import { Readable, Transform } from 'node:stream'
+import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { isIP } from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -188,7 +190,7 @@ export async function stageFile(
   filename: string,
   destination: string,
   maxBytes: number,
-  allowlist: string[],
+  allowlist: ReadonlySet<string>,
 ) {
   const name = filename.replace(/\\/g, '/').split('/').pop() || 'log.zip'
   const suffix = extname(name).toLowerCase()
@@ -220,7 +222,7 @@ async function stageLocalFile(sourceUrl: string, destination: string, maxBytes: 
   }
 }
 
-async function downloadSafe(initialUrl: string, destination: string, maxBytes: number, allowlist: string[]) {
+async function downloadSafe(initialUrl: string, destination: string, maxBytes: number, allowlist: ReadonlySet<string>) {
   let current = initialUrl
   const endAt = Date.now() + 120_000
   for (let redirects = 0; redirects <= 5; redirects++) {
@@ -228,21 +230,30 @@ async function downloadSafe(initialUrl: string, destination: string, maxBytes: n
     if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) {
       throw new Error('附件下载链接无效。')
     }
-    await validateHost(url.hostname, allowlist)
+    const address = await validateHost(url.hostname, allowlist)
     const remaining = endAt - Date.now()
     if (remaining <= 0) throw new Error('下载日志文件超时，请重新上传。')
-    const response = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(remaining) })
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location')
+    const response = await requestPinned(url, address, remaining)
+    const status = response.statusCode || 0
+    if (status >= 300 && status < 400) {
+      const rawLocation = response.headers.location
+      const location = Array.isArray(rawLocation) ? rawLocation[0] : rawLocation
+      response.destroy()
       if (!location || redirects === 5) throw new Error('附件下载重定向无效或次数过多。')
       current = new URL(location, url).href
       continue
     }
-    if (!response.ok || !response.body) throw new Error('下载日志文件失败，文件链接可能已过期，请重新上传。')
-    const length = Number(response.headers.get('content-length') || 0)
-    if (length > maxBytes) throw sizeError(maxBytes)
+    if (status < 200 || status >= 300) {
+      response.destroy()
+      throw new Error('下载日志文件失败，文件链接可能已过期，请重新上传。')
+    }
+    const length = Number(response.headers['content-length'] || 0)
+    if (length > maxBytes) {
+      response.destroy()
+      throw sizeError(maxBytes)
+    }
     try {
-      return await copyLimited(Readable.fromWeb(response.body as any), destination, maxBytes)
+      return await copyLimited(response, destination, maxBytes)
     } catch (error) {
       await fs.rm(destination, { force: true }).catch(() => {})
       if (Date.now() >= endAt) throw new Error('下载日志文件超时，请重新上传。')
@@ -266,10 +277,11 @@ async function copyLimited(source: NodeJS.ReadableStream, destination: string, m
   return total
 }
 
-async function validateHost(hostname: string, allowlist: string[]) {
+async function validateHost(hostname: string, allowlist: ReadonlySet<string>) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
   if (host === 'localhost' || host.endsWith('.local')) throw new Error('拒绝访问本机或本地域名附件地址。')
-  if (allowlist.length && !allowlist.some(item => host === item.toLowerCase().replace(/^\.|\.$/g, '') || host.endsWith(`.${item.toLowerCase().replace(/^\.|\.$/g, '')}`))) {
+  const entries = [...allowlist].map(item => item.trim().toLowerCase().replace(/^\.|\.$/g, '')).filter(Boolean)
+  if (entries.length && !entries.some(item => host === item || host.endsWith(`.${item}`))) {
     throw new Error('附件下载域名不在配置的白名单中。')
   }
   let addresses: { address: string; family: number }[]
@@ -282,6 +294,32 @@ async function validateHost(hostname: string, allowlist: string[]) {
   if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
     throw new Error('拒绝访问内网或保留地址附件链接。')
   }
+  return addresses[0]
+}
+
+function requestPinned(url: URL, address: { address: string; family: number }, timeout: number) {
+  return new Promise<IncomingMessage>((resolve, reject) => {
+    const options: any = {
+      method: 'GET',
+      agent: false,
+      headers: { Host: url.host },
+      signal: AbortSignal.timeout(timeout),
+      // Pin the socket's DNS result to the public IP that was validated above.
+      // The URL hostname remains unchanged for Host and TLS certificate checks.
+      lookup: (_hostname: string, lookupOptions: any, callback: (...args: any[]) => void) => {
+        if (lookupOptions?.all) callback(null, [address])
+        else callback(null, address.address, address.family)
+      },
+    }
+    const tlsHost = url.hostname.replace(/^\[|\]$/g, '')
+    if (url.protocol === 'https:' && !isIP(tlsHost)) options.servername = tlsHost
+    const onResponse = (response: IncomingMessage) => resolve(response)
+    const request = url.protocol === 'https:'
+      ? httpsRequest(url, options, onResponse)
+      : httpRequest(url, options, onResponse)
+    request.once('error', reject)
+    request.end()
+  })
 }
 
 function isPublicAddress(address: string) {

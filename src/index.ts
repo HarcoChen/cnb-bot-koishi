@@ -185,7 +185,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       if (!path) return (await failTask(task, '无法找到暂存的日志文件，请重新上传。')).last_error
       let stat
       try { stat = await fs.stat(path) } catch {
-        await store.update(id, { prepared_path: '', external_phase: '', last_error: '找不到暂存日志，请重新上传。' }, 'WAITING_LOG')
+        await store.update(id, { prepared_path: '', external_phase: '', last_error: '找不到暂存日志，请重新上传。' }, 'WAITING_LOG', false, ['CREATING_ISSUE'])
         return '暂存日志已失效，请重新上传一个 .zip 或 .log 文件。'
       }
       let client: CNBClient
@@ -244,7 +244,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       task = await store.get(id) || task
       const marker = `[CNB-BOT:${id}:FINAL]`
       const trigger = triggerBody(id, marker)
-      const startedAt = now()
+      const startedAt = Math.floor(now())
       const wait = minutes(config.analysis_wait_minutes, 20)
       task = await store.update(id, {
         trigger_body: trigger,
@@ -290,7 +290,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       last_error: message,
       prepared_path: '',
       delivery_parts: [],
-    }, 'FAILED', true)
+    }, 'FAILED', true, ['CREATING_ISSUE'])
     if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
     return updated || { ...task, status: 'FAILED' as Status, last_error: message }
   }
@@ -303,7 +303,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
     const sourceName = String(file.attrs?.name || file.attrs?.filename || file.attrs?.title || 'log.zip')
     if (!sourceUrl) {
-      await store.update(task.id, { last_error: '适配器没有提供附件下载地址。' }, 'WAITING_LOG')
+      await store.update(task.id, { last_error: '适配器没有提供附件下载地址。' }, 'WAITING_LOG', false, ['PREPARING_LOG'])
       return session.send('此 QQ 适配器没有提供可读取的文件链接，请检查适配器的群文件支持后重新上传。')
     }
     const temporary = join(tmpDir, `${task.id}.upload`)
@@ -332,7 +332,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       await fs.rm(temporary, { force: true }).catch(() => {})
       const current = await store.get(task.id)
       if (current?.status === 'PREPARING_LOG') {
-        await store.update(task.id, { last_error: errorText(error) }, 'WAITING_LOG')
+        await store.update(task.id, { last_error: errorText(error) }, 'WAITING_LOG', false, ['PREPARING_LOG'])
       }
       const latest = await store.get(task.id)
       const suffix = latest?.status === 'WAITING_LOG'
@@ -371,7 +371,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     const nextRound = Math.max(1, Number(task.analysis_round) || 1) + 1
     const marker = `[CNB-BOT:${task.id}:ANALYSIS:${nextRound}:FINAL]`
     const body = triggerBody(task.id, marker, true)
-    const startedAt = now()
+    const startedAt = Math.floor(now())
     const previousStatus = task.status
     const replacedFields = [
       'trigger_body', 'trigger_marker', 'trigger_started_at', 'trigger_at', 'trigger_comment_id',
@@ -380,7 +380,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       'external_phase', 'uncertain_kind', 'last_error', 'reanalysis_return_status',
     ]
     const previousFields = Object.fromEntries(replacedFields.map(key => [key, task[key]]))
-    const updated = await store.update(task.id, {
+    const claimed = await store.transition(task.id, 'TRIGGERING_NPC', [previousStatus], {
       trigger_body: body,
       trigger_marker: marker,
       trigger_started_at: startedAt,
@@ -399,9 +399,10 @@ export function apply(ctx: Context, input: PluginConfig) {
       reanalysis_return_status: previousStatus === 'AWAITING_RECOVERY'
         ? 'AWAITING_RECOVERY'
         : String(task.reanalysis_return_status || ''),
-    }, 'TRIGGERING_NPC', false, [previousStatus])
-    if (!updated || updated.status !== 'TRIGGERING_NPC') {
-      return `当前状态为“${STATUS_LABELS[updated?.status || task.status]}”，暂时不能重新分析。`
+    })
+    if (!claimed || claimed.status !== 'TRIGGERING_NPC') {
+      const latest = await store.get(task.id)
+      return `当前状态为“${STATUS_LABELS[latest?.status || task.status]}”，暂时不能重新分析。`
     }
     try {
       const comment = await clientFor(String(task.repository || config.cnb_repository)).createComment(String(task.issue_number), body)
@@ -435,14 +436,14 @@ export function apply(ctx: Context, input: PluginConfig) {
       const comments = await client.listComments(String(task.issue_number))
       if (task.status === 'UNCERTAIN') {
         const match = comments.find(comment => String(comment.body || '') === String(task.trigger_body || '')
-          && (parseTime(comment.created_at) || 0) >= Number(task.trigger_started_at || 0))
+          && isAtOrAfter(parseTime(comment.created_at), Number(task.trigger_started_at || 0)))
         if (match) {
           task = await store.update(task.id, {
             trigger_comment_id: String(match.id || ''),
             trigger_at: Number(task.trigger_started_at || now()),
             next_poll_at: now() + seconds(config.poll_interval_seconds, 10, 5, 120),
             uncertain_kind: '', last_error: '', poll_attempts: 0,
-          }, 'WAITING_NPC') || task
+          }, 'WAITING_NPC', false, ['UNCERTAIN']) || task
         } else {
           await store.update(task.id, { next_poll_at: now() + seconds(config.poll_interval_seconds, 10, 5, 120) })
           return
@@ -459,7 +460,7 @@ export function apply(ctx: Context, input: PluginConfig) {
           return String(comment.id || '') !== String(task.trigger_comment_id || '')
             && String(comment.body || '').includes(marker)
             && (trustedIds.has(authorId) || trustedNames.has(username))
-            && created >= Number(task.trigger_at || task.trigger_started_at || 0)
+            && isAtOrAfter(created, Number(task.trigger_at || task.trigger_started_at || 0))
         })
         .sort((a, b) => a.created - b.created)
       if (!matches.length) {
@@ -557,7 +558,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     return `结论：${task.analysis_summary || '已返回分析，详见上方。'}\n\n问题解决了吗？\n· 已解决：发送 /debug resolve\n· 没解决：${how}补充现象，再发送 /debug analyze 重新分析`
   }
 
-  async function finish(task: Report, status: Status, message: string, extra: Record<string, any> = {}, expected?: Status[]) {
+  async function finish(task: Report, status: Status, message: string, extra: Record<string, any> = {}, expected: Status[] = [task.status]) {
     const updated = await store.update(task.id, {
       ...extra,
       last_error: status === 'FAILED' ? message : '',
@@ -613,10 +614,10 @@ export function apply(ctx: Context, input: PluginConfig) {
       return '已确认解决，报障结束，Issue 已关闭。感谢反馈！'
     } catch (error) {
       if (ambiguous(error)) {
-        await store.update(task.id, { next_issue_close_at: now() + 15, last_issue_error: errorText(error) }, 'CLOSING_ISSUE')
+        await store.update(task.id, { next_issue_close_at: now() + 15, last_issue_error: errorText(error) }, 'CLOSING_ISSUE', false, ['CLOSING_ISSUE'])
         return `关闭 Issue 的请求结果不确定，将自动重试。\nIssue：${task.issue_url}`
       }
-      await store.update(task.id, { next_issue_close_at: now() + 30, last_issue_error: errorText(error) }, 'CLOSING_ISSUE')
+      await store.update(task.id, { next_issue_close_at: now() + 30, last_issue_error: errorText(error) }, 'CLOSING_ISSUE', false, ['CLOSING_ISSUE'])
       return `关闭 Issue 失败，插件会自动重试：${errorText(error)}`
     }
   }
@@ -662,7 +663,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       await store.update(task.id, {
         next_issue_close_at: now() + 30,
         last_issue_error: errorText(error),
-      }, 'CLOSING_ISSUE')
+      }, 'CLOSING_ISSUE', false, ['CLOSING_ISSUE'])
     }
   }
 
@@ -670,7 +671,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     try {
       const comments = await clientFor(String(task.repository || config.cnb_repository)).listComments(String(task.issue_number))
       const match = comments.find(comment => String(comment.body || '') === String(task.trigger_body || '')
-        && (parseTime(comment.created_at) || 0) >= Number(task.trigger_started_at || 0))
+        && isAtOrAfter(parseTime(comment.created_at), Number(task.trigger_started_at || 0)))
       if (match) {
         await store.update(task.id, {
           trigger_comment_id: String(match.id || ''),
@@ -748,12 +749,12 @@ export function apply(ctx: Context, input: PluginConfig) {
       } else if (task.status === 'PREPARING_LOG') {
         const prepared = String(task.prepared_path || '')
         if (prepared && await fs.stat(prepared).then(() => true, () => false)) {
-          await store.update(task.id, { external_phase: 'prepared' }, 'CREATING_ISSUE')
+          await store.update(task.id, { external_phase: 'prepared' }, 'CREATING_ISSUE', false, ['PREPARING_LOG'])
           await createIssueFromPrepared(task.id)
         } else {
           const updated = await store.update(task.id, {
             last_error: '插件重启打断了日志提交，请重新上传。',
-          }, 'WAITING_LOG')
+          }, 'WAITING_LOG', false, ['PREPARING_LOG'])
           if (updated) await notify(updated, `插件重启打断了日志提交，请在 ${formatDuration(updated.deadline - now())}内重新上传。`)
         }
       } else if (task.status === 'CREATING_ISSUE') {
@@ -819,9 +820,14 @@ export function apply(ctx: Context, input: PluginConfig) {
         if (['PREPARING_LOG', 'CREATING_ISSUE', 'TRIGGERING_NPC', 'CLOSING_ISSUE'].includes(task.status)) {
           return `当前正在${STATUS_LABELS[task.status]}，请稍后再取消。`
         }
-        const latest = await store.update(task.id, {
-          last_error: '', prepared_path: '', delivery_parts: [], analysis_body: '',
-        }, 'CANCELLED', true)
+        const latest = await store.transition(
+          task.id,
+          'CANCELLED',
+          ['WAITING_LOG', 'WAITING_NPC', 'DELIVERING', 'AWAITING_RECOVERY', 'UNCERTAIN'],
+          { last_error: '', prepared_path: '', delivery_parts: [], analysis_body: '' },
+          true,
+        )
+        if (!latest) return '报障状态已变化，请发送 /debug status 查看进度。'
         if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
         if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'issue_creation') {
           return `报障已取消，但无法确认 Issue 是否已创建。请管理员在 CNB 仓库搜索追踪编号 ${task.id} 核对。`
@@ -940,16 +946,16 @@ export function apply(ctx: Context, input: PluginConfig) {
   })
 }
 
-function withDefaults(input: PluginConfig): PluginConfig {
-  return {
+function withDefaults(input: Partial<PluginConfig> = {}): PluginConfig {
+  const defaults: PluginConfig = {
     group_whitelist: [], private_whitelist: [], reply_in_disabled_groups: false,
     cnb_repository: '', cnb_token: '', cnb_api_endpoint: 'https://api.cnb.cool', cnb_web_endpoint: 'https://cnb.cool',
     npc_mention: '@CodeBuddy', npc_author_ids: [], npc_author_usernames: ['CodeBuddy'], assistant_name: '分析助手',
     log_location_hint: '', log_wait_minutes: 10, analysis_wait_minutes: 20, recovery_confirm_minutes: 30,
     max_log_file_mib: 20, poll_interval_seconds: 10, issue_check_interval_seconds: 30,
     delivery_send_timeout_seconds: 30, max_delivery_attempts: 10, file_url_host_allowlist: [], history_retention_days: 90,
-    ...input,
   }
+  return Object.assign(defaults, input)
 }
 
 function getScope(session: Session): Scope | undefined {
@@ -1116,6 +1122,13 @@ function parseTime(value: unknown) {
   if (typeof value === 'number') return value > 1e12 ? value / 1000 : value
   const parsed = new Date(String(value)).getTime()
   return Number.isFinite(parsed) ? parsed / 1000 : 0
+}
+
+function isAtOrAfter(timestamp: number, reference: number) {
+  // CNB comment timestamps may have whole-second precision while local
+  // request timestamps include milliseconds. Unique round markers provide
+  // identity; comparing at whole-second precision avoids false negatives.
+  return Math.floor(timestamp) >= Math.floor(reference)
 }
 
 function now() {
