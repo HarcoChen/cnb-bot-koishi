@@ -7,7 +7,7 @@ const ACTIVE = new Set<Status>([
 ])
 const INDEX_FIELDS = new Set([
   'id', 'active_key', 'status', 'platform', 'bot_id', 'guild_id', 'channel_id',
-  'user_id', 'direct', 'created_at', 'updated_at', 'deadline', 'revision',
+  'user_id', 'direct', 'created_at', 'updated_at', 'deadline', 'revision', 'scheduled_at',
 ])
 
 export function extendModel(ctx: any) {
@@ -25,12 +25,13 @@ export function extendModel(ctx: any) {
     updated_at: 'double',
     deadline: 'double',
     revision: { type: 'unsigned', initial: 0 },
+    scheduled_at: { type: 'double', initial: 0 },
     payload: 'json',
-  }, { primary: 'id', autoInc: false, unique: ['active_key'] })
+  }, { primary: 'id', autoInc: false, unique: ['active_key'], indexes: ['scheduled_at', 'status'] })
 }
 
 export class ReportStore {
-  constructor(private db: any) {}
+  constructor(private db: any, private onSchedule?: (time: number) => void) {}
 
   private decode(row: any): Report {
     const payload = row?.payload && typeof row.payload === 'object' ? row.payload : {}
@@ -56,6 +57,7 @@ export class ReportStore {
       updated_at: task.updated_at,
       deadline: task.deadline,
       revision: Number(task.revision || 0),
+      scheduled_at: scheduledAt(task),
       payload,
     }
   }
@@ -95,6 +97,7 @@ export class ReportStore {
   async create(task: Report): Promise<boolean> {
     try {
       await this.db.create(TABLE, this.encode(task))
+      this.onSchedule?.(scheduledAt(task))
       return true
     } catch (error) {
       // The unique active_key index arbitrates simultaneous debug requests.
@@ -161,8 +164,8 @@ export class ReportStore {
     expected?: Status[],
     expectedRevision?: number,
   ): Promise<{ task?: Report; applied: boolean }> {
+    let current = await this.get(id)
     for (let attempt = 0; attempt < 8; attempt++) {
-      const current = await this.get(id)
       if (!current) return { applied: false }
       if (expected && !expected.includes(current.status)) return { task: current, applied: false }
       if (status && status !== current.status && !expected) {
@@ -173,17 +176,30 @@ export class ReportStore {
       if (expectedRevision !== undefined && revision !== expectedRevision) {
         return { task: current, applied: false }
       }
-      const next = { ...current, ...patch, status: status ?? current.status }
+      const next: Report = { ...current, ...patch, status: status ?? current.status }
       if (releaseActive) next.active_key = null
       next.updated_at = Date.now() / 1000
       next.revision = revision + 1
 
       const query: Record<string, any> = { id, revision }
       if (expected) query.status = { $in: expected }
-      // Minato forbids including a primary key in an update, even unchanged.
-      const { id: _id, ...update } = this.encode(next)
-      const result = await this.db.set(TABLE, query, update)
-      if (result?.matched) return { task: await this.get(id), applied: true }
+      const changes: Record<string, any> = {
+        updated_at: next.updated_at,
+        revision: next.revision,
+        scheduled_at: scheduledAt(next),
+      }
+      for (const key of INDEX_FIELDS) {
+        if (key !== 'id' && key !== 'scheduled_at' && !Object.is(next[key], current[key])) changes[key] = next[key]
+      }
+      // Scheduling-only updates do not rewrite identity columns or the JSON payload.
+      const payloadChanged = Object.keys(patch).some(key =>
+        !INDEX_FIELDS.has(key) && !Object.is(next[key], current![key]))
+      if (payloadChanged) changes.payload = this.encode(next).payload
+      const result = await this.db.set(TABLE, query, changes)
+      if (result?.matched) {
+        this.onSchedule?.(scheduledAt(next))
+        return { task: await this.get(id), applied: true }
+      }
 
       // A concurrent write changed the record after the read. Retry ordinary
       // patches against the latest row; guarded transitions stop on a mismatch.
@@ -192,12 +208,25 @@ export class ReportStore {
         || (expectedRevision !== undefined && Number(latest.revision || 0) !== expectedRevision)) {
         return { task: latest, applied: false }
       }
+      current = latest
     }
-    return { task: await this.get(id), applied: false }
+    return { task: current, applied: false }
   }
 
   async listActive(): Promise<Report[]> {
-    return (await this.all()).filter(task => ACTIVE.has(task.status))
+    return (await this.db.get(TABLE, { status: { $in: [...ACTIVE] } })).map((row: any) => this.decode(row))
+  }
+
+  async listDue(time: number): Promise<Report[]> {
+    return (await this.db.get(TABLE, { scheduled_at: { $gt: 0, $lte: time } }))
+      .map((row: any) => this.decode(row))
+  }
+
+  async nextScheduled(): Promise<number> {
+    const [row] = await this.db.get(TABLE, { scheduled_at: { $gt: 0 } }, {
+      fields: ['scheduled_at'], sort: { scheduled_at: 'asc' }, limit: 1,
+    })
+    return Number(row?.scheduled_at || 0)
   }
 
   async remove(id: string) {
@@ -205,15 +234,31 @@ export class ReportStore {
   }
 
   async prune(before: number) {
-    const terminal = new Set<Status>(['DONE', 'EXPIRED', 'CANCELLED', 'FAILED'])
-    for (const task of await this.all()) {
-      if (!task.active_key && terminal.has(task.status) && task.updated_at < before) {
-        await this.remove(task.id)
-      }
-    }
+    await this.db.remove(TABLE, {
+      active_key: null,
+      status: { $in: ['DONE', 'EXPIRED', 'CANCELLED', 'FAILED'] },
+      updated_at: { $lt: before },
+    })
   }
 }
 
 export function activeKey(scope: Scope) {
   return [scope.platform, scope.bot_id, scope.guild_id, scope.user_id].join(':')
+}
+
+// Zero means this state is handled by the foreground flow, not the scheduler.
+export function scheduledAt(task: Report): number {
+  const due = (value: unknown) => Math.max(1, Number(value) || 1)
+  switch (task.status) {
+    case 'WAITING_LOG': return due(task.deadline)
+    case 'WAITING_NPC': return Math.min(due(task.next_poll_at), due(task.analysis_deadline))
+    case 'UNCERTAIN': return task.uncertain_kind === 'trigger_comment'
+      ? Math.min(due(task.next_poll_at), due(task.analysis_deadline)) : 0
+    case 'DELIVERING': return due(task.next_delivery_at)
+    case 'AWAITING_RECOVERY': return task.last_issue_error
+      ? due(task.next_issue_check_at)
+      : Math.min(due(task.next_issue_check_at), due(task.recovery_deadline))
+    case 'CLOSING_ISSUE': return due(task.next_issue_close_at)
+    default: return 0
+  }
 }

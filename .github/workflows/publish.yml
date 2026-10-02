@@ -2,7 +2,8 @@ name: Publish to npm
 
 on:
   push:
-    tags: ['v*']
+    # v0.1.2 is a GitHub-only release.
+    tags: ['v*', '!v0.1.2']
 
 permissions:
   contents: read

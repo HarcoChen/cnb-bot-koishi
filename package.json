@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-cnb-bot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Koishi plugin for submitting diagnostic logs to CNB Issues and relaying NPC analysis.",
   "repository": {
     "type": "git",
@@ -15,6 +15,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.cjs",
     "prepare": "npm run build",
     "pack:check": "node scripts/check-package.cjs"
   },
@@ -43,7 +44,9 @@
       "en": "Submit diagnostic logs to CNB Issues and relay NPC analysis."
     },
     "service": {
-      "required": ["database"]
+      "required": [
+        "database"
+      ]
     }
   }
 }

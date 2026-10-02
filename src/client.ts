@@ -32,6 +32,7 @@ export class CNBClient {
   readonly api: string
   readonly web: string
   readonly repository: string
+  private pendingComments = new Map<string, Promise<any[]>>()
 
   constructor(
     apiEndpoint: string,
@@ -91,7 +92,7 @@ export class CNBClient {
       } finally {
         reader.releaseLock()
       }
-      raw = Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString('utf8')
+      raw = Buffer.concat(chunks).toString('utf8')
     }
     let data: any = {}
     if (raw) {
@@ -125,8 +126,8 @@ export class CNBClient {
       throw new CNBAPIError('CNB 返回的附件上传 URL 不是有效 HTTPS 地址。')
     }
     let response: Response
+    const stream = createReadStream(filePath)
     try {
-      const stream = createReadStream(filePath)
       response = await fetch(uploadUrl, {
         method: 'PUT',
         headers: { 'Content-Type': contentType, 'Content-Length': String(size) },
@@ -134,8 +135,11 @@ export class CNBClient {
         duplex: 'half',
         signal: AbortSignal.timeout(120_000),
       } as RequestInit & { duplex: 'half' })
+      await response.body?.cancel().catch(() => {})
     } catch {
       throw new CNBNetworkError('CNB 附件上传结果不确定，请检查 CNB 外部状态。')
+    } finally {
+      stream.destroy()
     }
     if (!response.ok) throw new CNBAPIError(`CNB 附件上传失败（HTTP ${response.status}）。`, response.status)
     return { asset_link: String(asset.asset_link), download_url: String(asset.download_url || ''), name }
@@ -161,7 +165,15 @@ export class CNBClient {
     return this.json('POST', `/${this.repoPath()}/-/issues/${encodeURIComponent(number)}/comments`, { body })
   }
 
-  async listComments(number: string) {
+  listComments(number: string): Promise<any[]> {
+    const pending = this.pendingComments.get(number)
+    if (pending) return pending
+    const request = this.fetchComments(number).finally(() => this.pendingComments.delete(number))
+    this.pendingComments.set(number, request)
+    return request
+  }
+
+  private async fetchComments(number: string) {
     const comments: any[] = []
     for (let page = 1; page <= 20; page++) {
       const result = await this.json('GET', `/${this.repoPath()}/-/issues/${encodeURIComponent(number)}/comments`, undefined, {

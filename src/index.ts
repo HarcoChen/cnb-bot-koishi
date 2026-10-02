@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { Context, h, Schema, Session } from 'koishi'
 import { CNBAPIError, CNBClient, CNBNetworkError, stageFile } from './client'
-import { extendModel, ReportStore, activeKey } from './storage'
+import { extendModel, ReportStore, activeKey, scheduledAt } from './storage'
 import type { Config as PluginConfig, Report, Scope, Status } from './types'
 
 export const name = 'cnb-bot'
@@ -65,22 +65,51 @@ const ENGLISH_COMMANDS = ['help', 'analyze', 'status', 'resolve', 'cancel']
 export function apply(ctx: Context, input: PluginConfig) {
   const config = withDefaults(input)
   extendModel(ctx)
-  const store = new ReportStore((ctx as any).database)
+  const store = new ReportStore((ctx as any).database, schedule)
   const dataDir = resolve(ctx.baseDir, 'data', 'koishi-plugin-cnb-bot')
   const tmpDir = join(dataDir, 'tmp')
   const preparedDir = join(dataDir, 'prepared')
   const log = ctx.logger('cnb-bot')
   let timer: NodeJS.Timeout | undefined
-  let stopped = false
+  let stopped = true
+  let timerAt = 0
   let ticking = false
   const locks = new Map<string, Promise<unknown>>()
+  const groupWhitelist = configValues(config.group_whitelist)
+  const privateWhitelist = configValues(config.private_whitelist)
+  const fileHostAllowlist = configValues(config.file_url_host_allowlist)
+  const trustedIds = configValues(config.npc_author_ids)
+  const trustedNames = configValues(config.npc_author_usernames)
 
-  const clientFor = (repository = config.cnb_repository) => new CNBClient(
-    config.cnb_api_endpoint,
-    config.cnb_web_endpoint,
-    repository,
-    config.cnb_token,
-  )
+  function schedule(time: number) {
+    if (stopped || ticking || !time) return
+    const target = Math.max(now() + 1, time)
+    if (timer && timerAt <= target) return
+    if (timer) clearTimeout(timer)
+    timerAt = target
+    timer = setTimeout(() => {
+      timer = undefined
+      timerAt = 0
+      void tick()
+    }, Math.min((target - now()) * 1000, 2 ** 31 - 1))
+  }
+
+  async function scheduleNext() {
+    try { schedule(await store.nextScheduled()) } catch (error) {
+      log.warn('查询下次报障处理时间失败：%s', errorText(error))
+      schedule(now() + 30)
+    }
+  }
+
+  const clients = new Map<string, CNBClient>()
+  function clientFor(repository = config.cnb_repository) {
+    let client = clients.get(repository)
+    if (!client) {
+      client = new CNBClient(config.cnb_api_endpoint, config.cnb_web_endpoint, repository, config.cnb_token)
+      clients.set(repository, client)
+    }
+    return client
+  }
 
   function lock<T>(id: string, action: () => Promise<T>): Promise<T> {
     const previous = locks.get(id) || Promise.resolve()
@@ -184,9 +213,10 @@ export function apply(ctx: Context, input: PluginConfig) {
       let task = await store.get(id)
       if (!task || task.status !== 'CREATING_ISSUE') return '这份日志已在处理中，或报障已结束。'
       const path = String(task.prepared_path || '')
-      if (!path) return (await failTask(task, '无法找到暂存的日志文件，请重新上传。')).last_error
+      const alreadyUploaded = task.external_phase === 'asset_uploaded' && !!task.asset_link
+      if (!path && !alreadyUploaded) return (await failTask(task, '无法找到暂存的日志文件，请重新上传。')).last_error
       let stat
-      try { stat = await fs.stat(path) } catch {
+      try { stat = alreadyUploaded ? { size: Number(task.file_bytes) } : await fs.stat(path) } catch {
         await store.update(id, { prepared_path: '', external_phase: '', last_error: '找不到暂存日志，请重新上传。' }, 'WAITING_LOG', false, ['CREATING_ISSUE'])
         return '暂存日志已失效，请重新上传一个 .zip 或 .log 文件。'
       }
@@ -196,14 +226,16 @@ export function apply(ctx: Context, input: PluginConfig) {
       }
 
       try {
-        task = await store.update(id, { external_phase: 'asset_upload' }, undefined, false, ['CREATING_ISSUE']) || task
-        const asset = await client.uploadAttachment(path, String(task.source_filename || basename(path)), stat.size)
-        const afterUpload = await store.get(id)
-        if (!afterUpload || afterUpload.status !== 'CREATING_ISSUE') {
-          await fs.rm(path, { force: true }).catch(() => {})
-          return '报障已取消。'
+        if (!alreadyUploaded) {
+          task = await store.update(id, { external_phase: 'asset_upload' }, undefined, false, ['CREATING_ISSUE']) || task
+          const asset = await client.uploadAttachment(path, String(task.source_filename || basename(path)), stat.size)
+          // Persist the remote reference before discarding the resumable local copy.
+          task = await store.update(id, {
+            external_phase: 'asset_uploaded', asset_link: asset.asset_link, prepared_path: '',
+          }, undefined, false, ['CREATING_ISSUE']) || task
+          await fs.rm(path, { force: true })
+          if (task.status !== 'CREATING_ISSUE') return '报障已取消。'
         }
-        task = await store.update(id, { external_phase: 'asset_uploaded', asset_link: asset.asset_link }, undefined, false, ['CREATING_ISSUE']) || task
       } catch (error) {
         if (ambiguous(error)) {
           const latest = await store.get(id) || task
@@ -230,7 +262,6 @@ export function apply(ctx: Context, input: PluginConfig) {
           source_filename: '',
           file_bytes: 0,
         }, 'TRIGGERING_NPC', false, ['CREATING_ISSUE']) || task
-        await fs.rm(path, { force: true }).catch(() => {})
         if (task.status !== 'TRIGGERING_NPC') return 'Issue 已创建，但报障已取消。'
       } catch (error) {
         if (ambiguous(error)) {
@@ -239,7 +270,6 @@ export function apply(ctx: Context, input: PluginConfig) {
         } else {
           await failTask(task, `创建 CNB Issue 失败：${errorText(error)}`)
         }
-        await fs.rm(path, { force: true }).catch(() => {})
         return (await store.get(id))?.last_error || '创建 Issue 失败，请联系管理员。'
       }
 
@@ -272,12 +302,10 @@ export function apply(ctx: Context, input: PluginConfig) {
           prepared_path: '',
         }, 'WAITING_NPC', false, ['TRIGGERING_NPC']) || task
         if (task.status !== 'WAITING_NPC') return '报障已取消。'
-        await fs.rm(path, { force: true }).catch(() => {})
         return submittedNotice(task)
       } catch (error) {
         if (ambiguous(error)) {
-          const uncertain = await setUncertain(await store.get(id) || task, 'trigger_comment', '正在核对分析请求是否已提交。')
-          await fs.rm(path, { force: true }).catch(() => {})
+          await setUncertain(await store.get(id) || task, 'trigger_comment', '正在核对分析请求是否已提交。')
           return `${config.assistant_name}的分析请求提交结果不确定，正在核对，请稍后发送 debug status。\nIssue：${task.issue_url}`
         }
         const failed = await failTask(
@@ -285,7 +313,6 @@ export function apply(ctx: Context, input: PluginConfig) {
           `Issue 已创建，但触发分析失败：${errorText(error)}\nIssue：${task.issue_url}`,
           ['TRIGGERING_NPC'],
         )
-        await fs.rm(path, { force: true }).catch(() => {})
         return failed.last_error || 'Issue 已创建，但触发分析失败；请查看 Issue 并联系管理员。'
       }
     })
@@ -322,7 +349,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         sourceName,
         temporary,
         Math.floor(clamp(config.max_log_file_mib, 1, 1024, 20) * 1024 * 1024),
-        configValues(config.file_url_host_allowlist),
+        fileHostAllowlist,
       )
       const prepared = join(preparedDir, `${task.id}${staged.suffix}`)
       await fs.rename(temporary, prepared)
@@ -348,6 +375,40 @@ export function apply(ctx: Context, input: PluginConfig) {
         : ''
       await session.send(`${errorText(error)}${suffix}`)
     }
+  }
+
+  async function appendAttachment(task: Report, file: any): Promise<string> {
+    return lock(`attachment:${task.id}`, async () => {
+      const current = await store.get(task.id)
+      if (!current?.issue_number || !['WAITING_NPC', 'AWAITING_RECOVERY'].includes(current.status)) {
+        return '当前流程正在处理或已结束，请等待分析开始后再追加日志。'
+      }
+      const path = join(tmpDir, `${task.id}-${randomUUID()}.upload`)
+      const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
+      const sourceName = String(file.attrs?.name || file.attrs?.filename || file.attrs?.title || 'log.zip')
+      if (!sourceUrl) return '适配器没有提供附件下载地址，请检查适配器的文件支持。'
+      try {
+        const staged = await stageFile(sourceUrl, sourceName, path,
+          Math.floor(clamp(config.max_log_file_mib, 1, 1024, 20) * 1024 * 1024), fileHostAllowlist)
+        const latest = await store.get(task.id)
+        if (!latest || TERMINAL.has(latest.status) || latest.status === 'CLOSING_ISSUE') return '报障已结束，这份日志没有提交。'
+        const client = clientFor(String(current.repository || config.cnb_repository))
+        const asset = await client.uploadAttachment(path, staged.name, staged.size)
+        await fs.rm(path, { force: true })
+        const afterUpload = await store.get(task.id)
+        if (!afterUpload || TERMINAL.has(afterUpload.status) || afterUpload.status === 'CLOSING_ISSUE') {
+          return '附件已上传，但报障已结束，未添加到 Issue。'
+        }
+        await client.createComment(String(current.issue_number),
+          `## 追加日志附件\n\n${issueBody(current, asset, staged.size, staged.suffix)}`)
+        return `日志已追加到 Issue。补充完后发送 debug analyze，请${config.assistant_name}重新分析。\nIssue：${current.issue_url}`
+      } catch (error) {
+        if (ambiguous(error)) return `追加日志提交结果不确定，请检查 Issue 后再决定是否重发。\nIssue：${current.issue_url}`
+        return `追加日志失败：${errorText(error)}`
+      } finally {
+        await fs.rm(path, { force: true }).catch(error => log.warn('清理追加日志失败：%s', errorText(error)))
+      }
+    })
   }
 
   async function appendComment(task: Report, text: string) {
@@ -458,26 +519,30 @@ export function apply(ctx: Context, input: PluginConfig) {
         }
       }
       const marker = String(task.trigger_marker || `[CNB-BOT:${task.id}:FINAL]`)
-      const trustedIds = new Set(configValues(config.npc_author_ids))
-      const trustedNames = new Set(configValues(config.npc_author_usernames))
-      const matches = comments.map(comment => ({ comment, created: parseTime(comment.created_at) || 0 }))
-        .filter(({ comment, created }) => {
-          const author = comment.author || comment.user || {}
-          const authorId = String(author.id || '')
-          const username = String(author.username || '')
-          return String(comment.id || '') !== String(task.trigger_comment_id || '')
-            && String(comment.body || '').includes(marker)
-            && (trustedIds.has(authorId) || trustedNames.has(username))
-            && isAtOrAfter(created, Number(task.trigger_at || task.trigger_started_at || 0))
-        })
-        .sort((a, b) => a.created - b.created)
-      if (!matches.length) {
+      const triggerId = String(task.trigger_comment_id || '')
+      const triggerAt = Number(task.trigger_at || task.trigger_started_at || 0)
+      let comment: any
+      let earliest = Infinity
+      for (const candidate of comments) {
+        const author = candidate.author || candidate.user || {}
+        if (!(trustedIds.has(String(author.id || '')) || trustedNames.has(String(author.username || '')))
+          || String(candidate.id || '') === triggerId
+          || !String(candidate.body || '').includes(marker)) continue
+        const created = parseTime(candidate.created_at) || 0
+        if (isAtOrAfter(created, triggerAt) && created < earliest) {
+          comment = candidate
+          earliest = created
+        }
+      }
+      if (!comment) {
         await store.update(task.id, { next_poll_at: now() + seconds(config.poll_interval_seconds, 10, 5, 120), poll_attempts: 0 })
         return
       }
-      const comment = matches[0].comment
       const raw = String(comment.body || '').replace(marker, '').trim()
-      if (!raw) return
+      if (!raw) {
+        await store.update(task.id, { next_poll_at: now() + seconds(config.poll_interval_seconds, 10, 5, 120) })
+        return
+      }
       const formatted = formatAnalysis(raw)
       const summary = analysisSummary(raw)
       const parts = [`Issue：${task.issue_url}\n\n${formatted}`, recoveryPrompt(task)]
@@ -712,8 +777,9 @@ export function apply(ctx: Context, input: PluginConfig) {
   async function tick() {
     if (ticking || stopped) return
     ticking = true
+    let queryFailed = false
     try {
-      for (const task of await store.listActive()) {
+      for (const task of await store.listDue(now())) {
         try {
           const time = now()
           if (task.status === 'WAITING_LOG' && task.deadline <= time) {
@@ -722,10 +788,10 @@ export function apply(ctx: Context, input: PluginConfig) {
             if (Number(task.analysis_deadline || 0) <= time) {
               await analysisTimedOut(task)
             } else if (Number(task.next_poll_at || 0) <= time) await pollNPC(task)
-          } else if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'trigger_comment' && Number(task.next_poll_at || 0) <= time) {
+          } else if (task.status === 'UNCERTAIN' && task.uncertain_kind === 'trigger_comment') {
             if (Number(task.analysis_deadline || 0) <= time) {
               await analysisTimedOut(task)
-            } else await reconcileTrigger(task)
+            } else if (Number(task.next_poll_at || 0) <= time) await reconcileTrigger(task)
           } else if (task.status === 'DELIVERING' && Number(task.next_delivery_at || 0) <= time) {
             await deliver(task)
           } else if (task.status === 'AWAITING_RECOVERY' && (
@@ -741,9 +807,12 @@ export function apply(ctx: Context, input: PluginConfig) {
         }
       }
     } catch (error) {
+      queryFailed = true
       log.warn('CNB 报障后台轮询失败：%s', errorText(error))
     } finally {
       ticking = false
+      if (queryFailed) schedule(now() + 30)
+      else await scheduleNext()
     }
   }
 
@@ -762,6 +831,8 @@ export function apply(ctx: Context, input: PluginConfig) {
       if (!retainedPrepared.has(path)) await fs.rm(path, { force: true }).catch(() => {})
     }
     for (const task of activeTasks) {
+      // Backfill scheduling metadata for records created by older plugin versions.
+      if (Number(task.scheduled_at || 0) !== scheduledAt(task)) await store.update(task.id)
       if (task.status === 'WAITING_LOG' && task.deadline <= now()) {
         await finish(task, 'EXPIRED', '等待日志超时，报障已结束；需要时请重新发送 debug。', {}, ['WAITING_LOG'])
       } else if (task.status === 'PREPARING_LOG') {
@@ -776,8 +847,9 @@ export function apply(ctx: Context, input: PluginConfig) {
           if (updated) await notify(updated, `插件重启打断了日志提交，请在 ${formatDuration(updated.deadline - now())}内重新上传。`)
         }
       } else if (task.status === 'CREATING_ISSUE') {
-        if (['prepared', 'asset_upload', 'asset_uploaded'].includes(String(task.external_phase))
-          && task.prepared_path && await fs.stat(String(task.prepared_path)).then(() => true, () => false)) {
+        if ((task.external_phase === 'asset_uploaded' && task.asset_link)
+          || (['prepared', 'asset_upload'].includes(String(task.external_phase))
+            && task.prepared_path && await fs.stat(String(task.prepared_path)).then(() => true, () => false))) {
           await createIssueFromPrepared(task.id)
         } else {
           const uncertain = await setUncertain(task, 'issue_creation', '插件在创建 Issue 时重启，无法确认 Issue 是否已创建。')
@@ -808,9 +880,8 @@ export function apply(ctx: Context, input: PluginConfig) {
       if (!scope) return
       const privateChat = scope.direct
       if (privateChat) {
-        const allow = configValues(config.private_whitelist)
-        if (allow.size && !allow.has(scope.user_id)) return '此账号未获准使用私信报障，请联系管理员调整私信白名单。'
-      } else if (!configValues(config.group_whitelist).has(scope.guild_id)) {
+        if (privateWhitelist.size && !privateWhitelist.has(scope.user_id)) return '此账号未获准使用私信报障，请联系管理员调整私信白名单。'
+      } else if (!groupWhitelist.has(scope.guild_id)) {
         return config.reply_in_disabled_groups ? '此群未启用报障功能，请联系管理员配置群白名单。' : undefined
       }
       const arg = String(argument || '').trim()
@@ -900,7 +971,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     const rows = [`请在 ${ttl}内${scope.direct ? '' : '由你本人在本群'}上传一个 .zip 或 .log 日志文件。`]
     if (config.log_location_hint.trim()) rows.push(config.log_location_hint.trim())
     if (task.issue_title) rows.push(`Issue 标题：${task.issue_title}`)
-    rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可${scope.direct ? '直接私信' : '@我'}补充信息。`)
+    rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可继续上传日志，或${scope.direct ? '直接私信' : '@我'}补充信息。`)
     rows.push('注意：文件会原样提交到 CNB 仓库，不会读取或脱敏，请确认不含隐私内容。')
     rows.push('debug cancel 取消 · debug help 查看帮助')
     return rows.join('\n')
@@ -923,16 +994,16 @@ export function apply(ctx: Context, input: PluginConfig) {
       const scope = getScope(session)
       if (!scope) return
       if (scope.direct) {
-        const users = configValues(config.private_whitelist)
-        if (users.size && !users.has(scope.user_id)) return
-      } else if (!configValues(config.group_whitelist).has(scope.guild_id)) return
+        if (privateWhitelist.size && !privateWhitelist.has(scope.user_id)) return
+      } else if (!groupWhitelist.has(scope.guild_id)) return
 
       const files = (session.elements || []).filter(element => element.type === 'file') as any[]
       if (files.length) {
-        const waiting = await store.findWaiting(scope)
-        if (!waiting) return
-        if (files.length !== 1) return session.send('每次报障只接收一个 .zip 或 .log 文件，请只发送一个日志文件。')
-        await processAttachment(session, scope, files[0], waiting)
+        const task = await store.findActive(scope)
+        if (!task) return
+        if (files.length !== 1) return session.send('每条消息只接收一个 .zip 或 .log 文件；可以分多条消息追加日志。')
+        if (task.status === 'WAITING_LOG') await processAttachment(session, scope, files[0], task)
+        else await session.send(await appendAttachment(task, files[0]))
         return
       }
 
@@ -952,15 +1023,17 @@ export function apply(ctx: Context, input: PluginConfig) {
   })
 
   ctx.on('ready', async () => {
-    stopped = false
+    stopped = true
     try { await recover() } catch (error) { log.warn('恢复 CNB 报障状态失败：%s', errorText(error)) }
-    if (!timer) timer = setInterval(() => void tick(), 3000)
+    stopped = false
+    await scheduleNext()
     log.info('CNB 报障后台任务已启动。')
   })
   ctx.on('dispose', () => {
     stopped = true
-    if (timer) clearInterval(timer)
+    if (timer) clearTimeout(timer)
     timer = undefined
+    timerAt = 0
   })
 }
 
@@ -1016,7 +1089,7 @@ function helpText(privateChat: boolean, assistantName: string) {
     `debug analyze 补充信息后请${assistantName}重新分析`,
     'debug resolve 确认问题已解决',
     'debug cancel 取消报障',
-    `Issue 创建后，${how}发送文字即可补充到 Issue。`,
+    `Issue 创建后，${how}发送文字即可补充到 Issue；分析中或等待确认时可直接上传文件追加日志。`,
   ].join('\n')
 }
 

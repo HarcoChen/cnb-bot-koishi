@@ -24,6 +24,8 @@ jobs:
           cache: npm
       - name: Install dependencies and build
         run: npm ci
+      - name: Test workflows
+        run: node --test tests/*.test.cjs
       - name: Verify and pack plugin
         run: npm run pack:check
       - uses: actions/upload-artifact@v7
