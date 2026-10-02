@@ -2,14 +2,19 @@ name: Publish to npm
 
 on:
   push:
-    # v0.1.2 is a GitHub-only release.
-    tags: ['v*', '!v0.1.2']
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to publish (for example v0.1.2)'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +26,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -30,6 +37,11 @@ jobs:
         run: npm install --global npm@11
       - name: Install dependencies and build
         run: npm ci
+      - name: Verify release tag matches package version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          node -e 'const pkg = require("./package.json"); if (process.env.RELEASE_TAG !== "v" + pkg.version) throw new Error("Release tag must match package version")'
       - name: Verify version and pack plugin
         id: pack
         run: npm run pack:check
