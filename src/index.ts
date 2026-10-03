@@ -393,7 +393,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         const latest = await store.get(task.id)
         if (!latest || TERMINAL.has(latest.status) || latest.status === 'CLOSING_ISSUE') return '报障已结束，这份日志没有提交。'
         const client = clientFor(String(current.repository || config.cnb_repository))
-        const asset = await client.uploadAttachment(path, staged.name, staged.size)
+        const asset = await client.uploadCommentAttachment(String(current.issue_number), path, staged.name, staged.size)
         await fs.rm(path, { force: true })
         const afterUpload = await store.get(task.id)
         if (!afterUpload || TERMINAL.has(afterUpload.status) || afterUpload.status === 'CLOSING_ISSUE') {

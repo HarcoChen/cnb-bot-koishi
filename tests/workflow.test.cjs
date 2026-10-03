@@ -64,7 +64,7 @@ async function fixture(t) {
   }
   apply(ctx, { cnb_repository: 'group/repo', cnb_token: 'fake-token' })
   const originals = {}
-  for (const name of ['uploadAttachment', 'createIssue', 'createComment', 'listComments']) originals[name] = CNBClient.prototype[name]
+  for (const name of ['uploadAttachment', 'uploadCommentAttachment', 'createIssue', 'createComment', 'listComments']) originals[name] = CNBClient.prototype[name]
   t.after(async () => {
     hooks.dispose()
     Object.assign(CNBClient.prototype, originals)
@@ -83,6 +83,7 @@ async function fixture(t) {
     calls.uploads.push(file)
     return { asset_link: `[${name}](https://cnb.cool/asset/${calls.uploads.length})` }
   }
+  CNBClient.prototype.uploadCommentAttachment = function(_issue, file, name, size) { return CNBClient.prototype.uploadAttachment.call(this, file, name, size) }
   CNBClient.prototype.createIssue = async function(title, body) {
     for (const file of calls.uploads) await assert.rejects(fs.stat(file), { code: 'ENOENT' })
     calls.issues.push({ title, body })
@@ -105,8 +106,8 @@ test('delete uploaded copies before creating Issue; append logs to the same Issu
   assert.equal(f.database.rows[0].status, 'WAITING_NPC')
   assert.equal(f.database.rows[0].payload.prepared_path, '')
   await f.hooks.message(f.session)
-  assert.equal(f.calls.uploads.length, 2)
   assert.equal(f.calls.issues.length, 1)
+  assert.equal(f.calls.comments.length, 2)
   assert.equal(f.calls.comments.at(-1).number, '42')
   assert.match(f.calls.comments.at(-1).body, /追加日志附件/)
   assert.match(f.sent.at(-1), /debug analyze/)
@@ -353,4 +354,29 @@ test('analysis selection keeps author, round and time checks and selects the ear
   ]
   await f.command('status')
   assert.equal(f.database.rows[0].payload.analysis_comment_id, 'earliest')
+})
+
+test('comment attachments use the issue comment asset endpoint', async t => {
+  const originalFetch = global.fetch
+  t.after(() => { global.fetch = originalFetch })
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cnb-comment-'))
+  const file = path.join(dir, 'append.log')
+  await fs.writeFile(file, 'append log')
+  t.after(() => fs.rm(dir, { recursive: true, force: true }))
+  const calls = []
+  global.fetch = async (url, options) => {
+    calls.push({ url: String(url), options })
+    if (options.method === 'POST') return new Response(JSON.stringify({
+      upload_url: 'https://uploads.example.test/comment',
+      asset_link: '[append.log](https://cnb.cool/asset/comment-1)',
+    }))
+    for await (const chunk of options.body) assert.equal(chunk.toString(), 'append log')
+    return new Response('{}')
+  }
+  const client = new CNBClient('https://api.cnb.cool', 'https://cnb.cool', 'group/repo', 'fake')
+  const asset = await client.uploadCommentAttachment('42', file, 'append.log', 10)
+  assert.match(calls[0].url, /issues\/42\/comment-file-asset-upload-url$/)
+  assert.deepEqual(JSON.parse(calls[0].options.body), { name: 'append.log', size: 10, content_type: 'text/plain' })
+  assert.equal(calls[1].options.method, 'PUT')
+  assert.match(asset.asset_link, /comment-1/)
 })

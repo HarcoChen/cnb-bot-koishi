@@ -125,8 +125,32 @@ export class CNBClient {
     if (uploadUrl.protocol !== 'https:' || uploadUrl.username || uploadUrl.password) {
       throw new CNBAPIError('CNB 返回的附件上传 URL 不是有效 HTTPS 地址。')
     }
-    let response: Response
+    await this.uploadToUrl(filePath, uploadUrl, contentType, size)
+    return { asset_link: String(asset.asset_link), download_url: String(asset.download_url || ''), name }
+  }
+
+  async uploadCommentAttachment(issueNumber: string, filePath: string, filename: string, size: number): Promise<Asset> {
+    const name = filename.split(/[\\/]/).pop() || 'log.zip'
+    const contentType = extname(name).toLowerCase() === '.log' ? 'text/plain' : 'application/zip'
+    const asset = await this.json(
+      'POST',
+      `/${this.repoPath()}/-/issues/${encodeURIComponent(issueNumber)}/comment-file-asset-upload-url`,
+      { name, size, content_type: contentType },
+    )
+    if (!asset?.upload_url || !asset?.asset_link) {
+      throw new CNBAPIError('CNB 创建评论附件上传地址时没有返回完整的附件信息。')
+    }
+    const uploadUrl = new URL(String(asset.upload_url))
+    if (uploadUrl.protocol !== 'https:' || uploadUrl.username || uploadUrl.password) {
+      throw new CNBAPIError('CNB 返回的评论附件上传 URL 不是有效 HTTPS 地址。')
+    }
+    await this.uploadToUrl(filePath, uploadUrl, contentType, size)
+    return { asset_link: String(asset.asset_link), download_url: String(asset.download_url || ''), name }
+  }
+
+  private async uploadToUrl(filePath: string, uploadUrl: URL, contentType: string, size: number) {
     const stream = createReadStream(filePath)
+    let response: Response
     try {
       response = await fetch(uploadUrl, {
         method: 'PUT',
@@ -142,7 +166,6 @@ export class CNBClient {
       stream.destroy()
     }
     if (!response.ok) throw new CNBAPIError(`CNB 附件上传失败（HTTP ${response.status}）。`, response.status)
-    return { asset_link: String(asset.asset_link), download_url: String(asset.download_url || ''), name }
   }
 
   async createIssue(title: string, body: string) {

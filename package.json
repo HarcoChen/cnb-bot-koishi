@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-cnb-bot",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Koishi plugin for submitting diagnostic logs to CNB Issues and relaying NPC analysis.",
   "repository": {
     "type": "git",
