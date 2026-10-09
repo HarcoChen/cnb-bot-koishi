@@ -5,6 +5,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { apply } = require('../lib/index')
+const { Session } = require('@satorijs/core')
 const { CNBClient, CNBAPIError, CNBNetworkError, stageFile, filenameFromDisposition } = require('../lib/client')
 const { ReportStore, scheduledAt } = require('../lib/storage')
 
@@ -432,13 +433,20 @@ test('OneBot raw event names are used when normalized file attributes lose the n
   const f = await fixture(t)
   const url = pathToFileURL(f.source).href
   f.session.elements = [{ type: 'file', attrs: { src: url, file: 'opaque-resource-id' } }]
-  f.session.event = { _type: 'onebot', _data: {
+  f.session.event = {}
+  f.session.bot = { internal: {} }
+  Session.prototype.setInternal.call(f.session, 'onebot', {
     message: [{ type: 'file', data: { name: 'original.json', url } }],
-  } }
+  })
+  assert.equal(f.session.onebot.message[0].data.name, 'original.json')
+  assert.equal(f.session.event._data.message[0].data.name, 'original.json')
   await f.command('')
   await f.hooks.message(f.session)
   assert.match(f.calls.issues[0].body, /\[original.json\]/)
-  f.session.event._data = { file: { name: 'additional.log', url } }
+  Session.prototype.setInternal.call(f.session, 'onebot', { file: { name: 'additional.log', url } })
+  // The public session accessor also works without serialized event metadata.
+  delete f.session.event._type
+  delete f.session.event._data
   await f.hooks.message(f.session)
   assert.match(f.calls.comments.at(-1).body, /\[additional.log\]/)
   assert.equal(f.calls.uploads.length, 2)

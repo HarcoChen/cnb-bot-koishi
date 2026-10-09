@@ -1253,8 +1253,9 @@ function attachmentName(file: any, session: Session): string {
   const attrs = file.attrs || {}
   const candidates = [attrs.name, attrs.filename, attrs.fileName, attrs.file_name, attrs.title]
   const event = session.event
-  if (event?._type === 'onebot') {
-    const raw = event._data || {}
+  const raw = (session as Session & { onebot?: any }).onebot
+    || (event?._type === 'onebot' ? event._data : undefined)
+  if (raw) {
     const segments = Array.isArray(raw.message)
       ? raw.message.filter((segment: any) => segment.type === 'file') : []
     const source = String(attrs.url || attrs.src || '')
