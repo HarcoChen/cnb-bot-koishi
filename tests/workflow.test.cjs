@@ -5,7 +5,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { apply } = require('../lib/index')
-const { CNBClient, CNBAPIError, CNBNetworkError } = require('../lib/client')
+const { CNBClient, CNBAPIError, CNBNetworkError, stageFile, filenameFromDisposition } = require('../lib/client')
 const { ReportStore, scheduledAt } = require('../lib/storage')
 
 function matches(row, query) {
@@ -379,4 +379,67 @@ test('comment attachments use the issue comment asset endpoint', async t => {
   assert.deepEqual(JSON.parse(calls[0].options.body), { name: 'append.log', size: 10, content_type: 'text/plain' })
   assert.equal(calls[1].options.method, 'PUT')
   assert.match(asset.asset_link, /comment-1/)
+})
+
+test('common diagnostic formats are accepted while unrelated binaries remain rejected', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cnb-formats-'))
+  t.after(() => fs.rm(dir, { recursive: true, force: true }))
+  const json = path.join(dir, 'diagnostic.json')
+  const exe = path.join(dir, 'program.exe')
+  await fs.writeFile(json, '{}')
+  await fs.writeFile(exe, 'binary')
+  const staged = path.join(dir, 'staged')
+  const result = await stageFile(pathToFileURL(json).href, 'diagnostic.json', staged, 1024, new Set())
+  assert.equal(result.suffix, '.json')
+  await assert.rejects(stageFile(pathToFileURL(exe).href, 'program.exe', path.join(dir, 'bad'), 1024, new Set()), /常见日志和诊断文件/)
+})
+
+test('adapter file names survive both initial and appended uploads', async t => {
+  const f = await fixture(t)
+  f.session.elements[0].attrs = { file: 'runtime.json', url: pathToFileURL(f.source).href }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.match(f.calls.issues[0].body, /\[runtime.json\]/)
+  assert.match(f.calls.issues[0].body, /文件类型：JSON/)
+  f.session.elements[0].attrs.file = 'second.txt'
+  await f.hooks.message(f.session)
+  assert.match(f.calls.comments.at(-1).body, /\[second.txt\]/)
+  assert.equal(await fs.readFile(f.source, 'utf8'), 'diagnostic log')
+})
+
+test('missing adapter names use a real URL filename and never default to log.zip', async t => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'cnb-filename-'))
+  t.after(() => fs.rm(dir, { recursive: true, force: true }))
+  const source = path.join(dir, '诊断.json')
+  const bytes = Buffer.from('{"message":"sample"}')
+  await fs.writeFile(source, bytes)
+  const destination = path.join(dir, 'staged')
+  const staged = await stageFile(pathToFileURL(source).href, '', destination, 1024, new Set())
+  assert.equal(staged.name, '诊断.json')
+  assert.deepEqual(await fs.readFile(destination), bytes)
+  const unknown = path.join(dir, 'opaque')
+  await fs.writeFile(unknown, bytes)
+  await assert.rejects(stageFile(pathToFileURL(unknown).href, '', path.join(dir, 'invalid'), 1024, new Set()), /无法确定附件的原始文件名/)
+})
+
+test('download response filenames support UTF-8 and ordinary Content-Disposition', () => {
+  assert.equal(filenameFromDisposition("attachment; filename=backup.zip; filename*=UTF-8''%E6%97%A5%E5%BF%97.json"), '日志.json')
+  assert.equal(filenameFromDisposition('attachment; filename="diagnostic.log"'), 'diagnostic.log')
+  assert.equal(filenameFromDisposition('attachment'), '')
+})
+
+test('OneBot raw event names are used when normalized file attributes lose the name', async t => {
+  const f = await fixture(t)
+  const url = pathToFileURL(f.source).href
+  f.session.elements = [{ type: 'file', attrs: { src: url, file: 'opaque-resource-id' } }]
+  f.session.event = { _type: 'onebot', _data: {
+    message: [{ type: 'file', data: { name: 'original.json', url } }],
+  } }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.match(f.calls.issues[0].body, /\[original.json\]/)
+  f.session.event._data = { file: { name: 'additional.log', url } }
+  await f.hooks.message(f.session)
+  assert.match(f.calls.comments.at(-1).body, /\[additional.log\]/)
+  assert.equal(f.calls.uploads.length, 2)
 })

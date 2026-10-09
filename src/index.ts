@@ -76,6 +76,7 @@ export function apply(ctx: Context, input: PluginConfig) {
   let ticking = false
   const locks = new Map<string, Promise<unknown>>()
   const groupWhitelist = configValues(config.group_whitelist)
+  const acceptedLogTypes = '.zip、.log、.json、.txt、.yaml、.yml、.xml、.csv 等常见诊断文件'
   const privateWhitelist = configValues(config.private_whitelist)
   const fileHostAllowlist = configValues(config.file_url_host_allowlist)
   const trustedIds = configValues(config.npc_author_ids)
@@ -144,7 +145,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     const rows = [`当前状态：${label}`]
     if (task.issue_url) rows.push(`Issue：${task.issue_url}`)
     if (task.status === 'WAITING_LOG') {
-      rows.push(`请在 ${formatDuration(task.deadline - now())}内上传一个 .zip 或 .log 文件。`)
+      rows.push(`请在 ${formatDuration(task.deadline - now())}内上传一个${acceptedLogTypes}。`)
     } else if (task.status === 'WAITING_NPC') {
       rows.push(`分析请求已提交，预计等待不超过 ${formatDuration(task.analysis_deadline - task.trigger_at)}。`)
     } else if (task.status === 'AWAITING_RECOVERY') {
@@ -167,7 +168,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       '## 原始日志附件',
       asset.asset_link,
       '',
-      `文件类型：${suffix === '.zip' ? 'ZIP' : 'LOG'}`,
+      `文件类型：${suffix.slice(1).toUpperCase()}`,
       `文件大小：${formatBytes(size)}（${size} 字节）`,
       '插件直接上传原始文件，不读取、扫描或脱敏文件内容。',
       '',
@@ -218,7 +219,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       let stat
       try { stat = alreadyUploaded ? { size: Number(task.file_bytes) } : await fs.stat(path) } catch {
         await store.update(id, { prepared_path: '', external_phase: '', last_error: '找不到暂存日志，请重新上传。' }, 'WAITING_LOG', false, ['CREATING_ISSUE'])
-        return '暂存日志已失效，请重新上传一个 .zip 或 .log 文件。'
+        return `暂存日志已失效，请重新上传一个${acceptedLogTypes}。`
       }
       let client: CNBClient
       try { client = clientFor(String(task.repository || config.cnb_repository)) } catch (error) {
@@ -336,7 +337,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       log.warn('发送日志接收回执失败，继续处理报障 %s：%s', task.id, errorText(error))
     }
     const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
-    const sourceName = String(file.attrs?.name || file.attrs?.filename || file.attrs?.title || 'log.zip')
+    const sourceName = attachmentName(file, session)
     if (!sourceUrl) {
       await store.update(task.id, { last_error: '适配器没有提供附件下载地址。' }, 'WAITING_LOG', false, ['PREPARING_LOG'])
       return session.send('此 QQ 适配器没有提供可读取的文件链接，请检查适配器的群文件支持后重新上传。')
@@ -377,7 +378,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     }
   }
 
-  async function appendAttachment(task: Report, file: any): Promise<string> {
+  async function appendAttachment(task: Report, file: any, session: Session): Promise<string> {
     return lock(`attachment:${task.id}`, async () => {
       const current = await store.get(task.id)
       if (!current?.issue_number || !['WAITING_NPC', 'AWAITING_RECOVERY'].includes(current.status)) {
@@ -385,7 +386,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       }
       const path = join(tmpDir, `${task.id}-${randomUUID()}.upload`)
       const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
-      const sourceName = String(file.attrs?.name || file.attrs?.filename || file.attrs?.title || 'log.zip')
+      const sourceName = attachmentName(file, session)
       if (!sourceUrl) return '适配器没有提供附件下载地址，请检查适配器的文件支持。'
       try {
         const staged = await stageFile(sourceUrl, sourceName, path,
@@ -968,7 +969,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         : '无法创建报障记录，请稍后重试或联系管理员。'
     }
     const ttl = formatDuration(task.deadline - now())
-    const rows = [`请在 ${ttl}内${scope.direct ? '' : '由你本人在本群'}上传一个 .zip 或 .log 日志文件。`]
+    const rows = [`请在 ${ttl}内${scope.direct ? '' : '由你本人在本群'}上传一个${acceptedLogTypes}。`]
     if (config.log_location_hint.trim()) rows.push(config.log_location_hint.trim())
     if (task.issue_title) rows.push(`Issue 标题：${task.issue_title}`)
     rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可继续上传日志，或${scope.direct ? '直接私信' : '@我'}补充信息。`)
@@ -1001,9 +1002,9 @@ export function apply(ctx: Context, input: PluginConfig) {
       if (files.length) {
         const task = await store.findActive(scope)
         if (!task) return
-        if (files.length !== 1) return session.send('每条消息只接收一个 .zip 或 .log 文件；可以分多条消息追加日志。')
+        if (files.length !== 1) return session.send(`每条消息只接收一个${acceptedLogTypes}；可以分多条消息追加日志。`)
         if (task.status === 'WAITING_LOG') await processAttachment(session, scope, files[0], task)
-        else await session.send(await appendAttachment(task, files[0]))
+        else await session.send(await appendAttachment(task, files[0], session))
         return
       }
 
@@ -1246,4 +1247,31 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+function attachmentName(file: any, session: Session): string {
+  const attrs = file.attrs || {}
+  const candidates = [attrs.name, attrs.filename, attrs.fileName, attrs.file_name, attrs.title]
+  const event = session.event
+  if (event?._type === 'onebot') {
+    const raw = event._data || {}
+    const segments = Array.isArray(raw.message)
+      ? raw.message.filter((segment: any) => segment.type === 'file') : []
+    const source = String(attrs.url || attrs.src || '')
+    const matched = segments.find((segment: any) => {
+      const data = segment.data || {}
+      return (attrs.id && String(data.id || data.file_id || '') === String(attrs.id))
+        || (source && String(data.url || data.file || '') === source)
+    }) || (segments.length === 1 ? segments[0] : undefined)
+    const rawFile = matched?.data || raw.file || {}
+    candidates.push(rawFile.name, rawFile.filename, rawFile.file_name)
+  }
+  candidates.push(typeof attrs.file === 'object' ? attrs.file?.name : undefined)
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  // A CQ file field can be a URL, local path or opaque ID, rather than a name.
+  if (typeof attrs.file === 'string' && !/^[a-z]+:/i.test(attrs.file)
+    && /\.[a-z0-9]+$/i.test(attrs.file)) return attrs.file
+  return ''
 }

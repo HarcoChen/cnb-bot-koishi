@@ -8,6 +8,11 @@ import { pipeline } from 'node:stream/promises'
 import { isIP } from 'node:net'
 import { fileURLToPath } from 'node:url'
 
+export const LOG_FILE_SUFFIXES = new Set([
+  '.zip', '.log', '.json', '.ndjson', '.txt', '.csv', '.xml', '.yaml', '.yml',
+  '.conf', '.config', '.ini', '.properties', '.md', '.tar', '.gz', '.tgz',
+])
+
 export class CNBAPIError extends Error {
   constructor(message: string, readonly status?: number) {
     super(message)
@@ -112,8 +117,8 @@ export class CNBClient {
   }
 
   async uploadAttachment(filePath: string, filename: string, size: number): Promise<Asset> {
-    const name = filename.split(/[\\/]/).pop() || 'log.zip'
-    const contentType = extname(name).toLowerCase() === '.log' ? 'text/plain' : 'application/zip'
+    const name = requireFilename(filename)
+    const contentType = contentTypeFor(name)
     const created = await this.json('POST', `/${this.repoPath()}/-/issues/asset-groups`, {
       file_assets: [{ name, size, content_type: contentType }],
     })
@@ -130,8 +135,8 @@ export class CNBClient {
   }
 
   async uploadCommentAttachment(issueNumber: string, filePath: string, filename: string, size: number): Promise<Asset> {
-    const name = filename.split(/[\\/]/).pop() || 'log.zip'
-    const contentType = extname(name).toLowerCase() === '.log' ? 'text/plain' : 'application/zip'
+    const name = requireFilename(filename)
+    const contentType = contentTypeFor(name)
     const asset = await this.json(
       'POST',
       `/${this.repoPath()}/-/issues/${encodeURIComponent(issueNumber)}/comment-file-asset-upload-url`,
@@ -227,17 +232,38 @@ export async function stageFile(
   maxBytes: number,
   allowlist: ReadonlySet<string>,
 ) {
-  const name = filename.replace(/\\/g, '/').split('/').pop() || 'log.zip'
+  let name = cleanFilename(filename)
+  if (name) validateFilename(name)
+  let size: number
+  if (sourceUrl.startsWith('file:')) {
+    name ||= filenameFromUrl(sourceUrl)
+    validateFilename(name)
+    size = await stageLocalFile(sourceUrl, destination, maxBytes)
+  } else {
+    const downloaded = await downloadSafe(sourceUrl, destination, maxBytes, allowlist, name)
+    name = downloaded.name
+    size = downloaded.size
+  }
   const suffix = extname(name).toLowerCase()
-  if (suffix !== '.zip' && suffix !== '.log') throw new Error('只接受 .zip 或 .log 日志文件，请重新上传。')
-  const size = sourceUrl.startsWith('file:')
-    ? await stageLocalFile(sourceUrl, destination, maxBytes)
-    : await downloadSafe(sourceUrl, destination, maxBytes, allowlist)
   if (!size) {
     await fs.rm(destination, { force: true }).catch(() => {})
     throw new Error('上传的日志文件为空。')
   }
   return { name, size, suffix }
+}
+
+function contentTypeFor(filename: string) {
+  const lower = filename.toLowerCase()
+  if (lower.endsWith('.zip')) return 'application/zip'
+  if (lower.endsWith('.json')) return 'application/json'
+  if (lower.endsWith('.ndjson')) return 'application/x-ndjson'
+  if (lower.endsWith('.yaml') || lower.endsWith('.yml')) return 'application/yaml'
+  if (lower.endsWith('.xml')) return 'application/xml'
+  if (lower.endsWith('.csv')) return 'text/csv'
+  if (lower.endsWith('.md')) return 'text/markdown'
+  if (lower.endsWith('.tar')) return 'application/x-tar'
+  if (lower.endsWith('.gz') || lower.endsWith('.tgz')) return 'application/gzip'
+  return 'text/plain'
 }
 
 async function stageLocalFile(sourceUrl: string, destination: string, maxBytes: number) {
@@ -257,7 +283,7 @@ async function stageLocalFile(sourceUrl: string, destination: string, maxBytes: 
   }
 }
 
-async function downloadSafe(initialUrl: string, destination: string, maxBytes: number, allowlist: ReadonlySet<string>) {
+async function downloadSafe(initialUrl: string, destination: string, maxBytes: number, allowlist: ReadonlySet<string>, originalName: string) {
   let current = initialUrl
   const endAt = Date.now() + 120_000
   for (let redirects = 0; redirects <= 5; redirects++) {
@@ -287,8 +313,18 @@ async function downloadSafe(initialUrl: string, destination: string, maxBytes: n
       response.destroy()
       throw sizeError(maxBytes)
     }
+    let name: string
     try {
-      return await copyLimited(response, destination, maxBytes)
+      name = originalName || filenameFromDisposition(String(response.headers['content-disposition'] || ''))
+        || filenameFromUrl(current) || filenameFromUrl(initialUrl)
+      validateFilename(name)
+    } catch (error) {
+      response.destroy()
+      throw error
+    }
+    try {
+      const size = await copyLimited(response, destination, maxBytes)
+      return { size, name }
     } catch (error) {
       await fs.rm(destination, { force: true }).catch(() => {})
       if (Date.now() >= endAt) throw new Error('下载日志文件超时，请重新上传。')
@@ -390,4 +426,46 @@ function formatBytes(size: number) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error)
+}
+
+function cleanFilename(value: string) {
+  return value.replace(/\\/g, '/').split('/').pop()?.trim() || ''
+}
+
+function requireFilename(value: string) {
+  const name = cleanFilename(value)
+  validateFilename(name)
+  return name
+}
+
+function validateFilename(name: string) {
+  if (!name) throw new Error('无法确定附件的原始文件名，请检查适配器是否提供文件名或下载响应中的文件名。')
+  if (!LOG_FILE_SUFFIXES.has(extname(name).toLowerCase())) {
+    throw new Error('只接受常见日志和诊断文件（.zip、.log、.json、.txt、.yaml、.yml、.xml、.csv 等），请重新上传。')
+  }
+}
+
+function filenameFromUrl(value: string) {
+  try {
+    const url = new URL(value)
+    for (const key of ['filename', 'file_name', 'name']) {
+      const name = cleanFilename(url.searchParams.get(key) || '')
+      if (LOG_FILE_SUFFIXES.has(extname(name).toLowerCase())) return name
+    }
+    const name = cleanFilename(decodeURIComponent(url.pathname))
+    return LOG_FILE_SUFFIXES.has(extname(name).toLowerCase()) ? name : ''
+  } catch { return '' }
+}
+
+export function filenameFromDisposition(value: string) {
+  const extended = /(?:^|;)\s*filename\*\s*=\s*(?:"([^"]*)"|([^;]*))/i.exec(value)
+  if (extended) {
+    const raw = (extended[1] ?? extended[2]).trim()
+    const encoded = /^utf-8'[^']*'(.*)$/i.exec(raw)
+    if (encoded) {
+      try { return cleanFilename(decodeURIComponent(encoded[1])) } catch {}
+    }
+  }
+  const ordinary = /(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;]*))/i.exec(value)
+  return ordinary ? cleanFilename(ordinary[1] ?? ordinary[2]) : ''
 }
