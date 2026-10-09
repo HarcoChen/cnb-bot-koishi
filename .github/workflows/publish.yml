@@ -1,4 +1,4 @@
-name: Publish to npm
+name: Publish to npm and GitHub Release
 
 on:
   push:
@@ -55,3 +55,38 @@ jobs:
           TARBALL: ${{ steps.pack.outputs.tarball }}
           DIST_TAG: ${{ steps.pack.outputs.dist-tag }}
         run: npm publish "./$TARBALL" --access public --tag "$DIST_TAG"
+
+  release:
+    name: Publish GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: npm-package
+          path: package
+      - name: Create release and upload npm package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(package/*.tgz)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected exactly one npm package artifact" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${packages[0]}" --clobber
+          else
+            release_options=(--verify-tag --title "$RELEASE_TAG" --generate-notes)
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              release_options+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${packages[0]}" "${release_options[@]}"
+          fi
