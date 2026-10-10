@@ -49,12 +49,13 @@ class Database {
   async remove(_table, query) { this.rows = this.rows.filter(row => !matches(row, query)) }
 }
 
-async function fixture(t) {
+async function fixture(t, config = {}) {
   const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cnb-workflow-'))
   const database = new Database()
   const hooks = {}
   let action
   const sent = []
+  const deleted = []
   const ctx = {
     baseDir, database,
     model: { extend() {} },
@@ -63,9 +64,9 @@ async function fixture(t) {
     command: () => ({ action(fn) { action = fn } }),
     on(event, fn) { hooks[event] = fn },
   }
-  apply(ctx, { cnb_repository: 'group/repo', cnb_token: 'fake-token' })
+  apply(ctx, { cnb_repository: 'group/repo', cnb_token: 'fake-token', ...config })
   const originals = {}
-  for (const name of ['uploadAttachment', 'uploadCommentAttachment', 'createIssue', 'createComment', 'listComments']) originals[name] = CNBClient.prototype[name]
+  for (const name of ['uploadAttachment', 'uploadCommentAttachment', 'createIssue', 'createComment', 'listComments', 'getIssue', 'closeIssue']) originals[name] = CNBClient.prototype[name]
   t.after(async () => {
     hooks.dispose()
     Object.assign(CNBClient.prototype, originals)
@@ -75,9 +76,11 @@ async function fixture(t) {
   await fs.writeFile(source, 'diagnostic log')
   const session = {
     platform: 'test', selfId: 'bot', userId: 'user', channelId: 'private', isDirect: true,
+    bot: { async deleteMessage(channelId, messageId) { deleted.push({ channelId, messageId }) } },
     elements: [{ type: 'file', attrs: { name: 'source.log', url: pathToFileURL(source).href } }],
-    async send(message) { sent.push(message) },
+    async send(message) { sent.push(message); return [`message-${sent.length}`] },
   }
+  ctx.bots.push({ platform: 'test', selfId: 'bot', async sendMessage(_channelId, message) { sent.push(message); return ['notification'] } })
   const calls = { uploads: [], issues: [], comments: [] }
   CNBClient.prototype.uploadAttachment = async function(file, name, size) {
     assert.equal((await fs.stat(file)).size, size)
@@ -96,8 +99,271 @@ async function fixture(t) {
     return { id: String(calls.comments.length) }
   }
   await hooks.ready()
-  return { database, hooks, session, source, calls, sent, command: arg => action({ session }, arg) }
+  return { database, hooks, session, source, calls, sent, deleted,
+    command: (arg, sessionOverride = session) => action({ session: sessionOverride }, arg) }
 }
+
+test('concurrent resolve commands close once and only one reports a new confirmation', async t => {
+  const f = await fixture(t)
+  await f.command('')
+  Object.assign(f.database.rows[0], { status: 'AWAITING_RECOVERY' })
+  Object.assign(f.database.rows[0].payload, { issue_number: '42', issue_state: 'open' })
+  let reads = 0, closes = 0
+  CNBClient.prototype.getIssue = async () => { reads++; return { state: 'open' } }
+  CNBClient.prototype.closeIssue = async () => { closes++ }
+  const replies = await Promise.all([f.command('resolve'), f.command('resolve')])
+  assert.equal(reads, 1)
+  assert.equal(closes, 1)
+  assert.equal(replies.filter(reply => reply === '已确认解决，报障结束，Issue 已关闭。感谢反馈！').length, 1)
+  assert.ok(replies.some(reply => /无需重复确认/.test(reply)))
+  assert.equal(f.database.rows[0].payload.closed_by_user, true)
+  assert.equal(f.sent.length, 1, 'command replies must not also be sent as notifications')
+})
+
+test('resolve racing an automatic timeout keeps the timeout reason and does not close again', async t => {
+  const f = await fixture(t)
+  await f.command('')
+  Object.assign(f.database.rows[0], { status: 'AWAITING_RECOVERY' })
+  Object.assign(f.database.rows[0].payload, { issue_number: '42', issue_state: 'open', recovery_deadline: 1 })
+  let closes = 0, releaseClose, signalClose
+  const started = new Promise(resolve => { signalClose = resolve })
+  CNBClient.prototype.getIssue = async () => ({ state: 'open' })
+  CNBClient.prototype.closeIssue = async () => {
+    closes++
+    if (closes === 1) {
+      signalClose()
+      await new Promise(resolve => { releaseClose = resolve })
+    }
+  }
+  const timeout = f.command('status')
+  await started
+  const confirmation = f.command('resolve')
+  releaseClose()
+  await timeout
+  assert.match(await confirmation, /已因等待确认超时自动关闭/)
+  assert.equal(closes, 1)
+  assert.equal(f.database.rows[0].status, 'DONE')
+  assert.equal(f.database.rows[0].payload.close_reason, 'recovery_timeout')
+  assert.notEqual(f.database.rows[0].payload.closed_by_user, true)
+  assert.equal(f.sent.filter(message => typeof message === 'string' && /等待确认超时/.test(message)).length, 1)
+})
+
+test('a background close and a resolve command produce one success notification', async t => {
+  const originalSetTimeout = global.setTimeout
+  const originalClearTimeout = global.clearTimeout
+  const timers = new Map()
+  global.setTimeout = (fn, delay) => { const handle = {}; timers.set(handle, { fn, delay }); return handle }
+  global.clearTimeout = handle => timers.delete(handle)
+  t.after(() => { global.setTimeout = originalSetTimeout; global.clearTimeout = originalClearTimeout })
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false })
+  await f.command('')
+  Object.assign(f.database.rows[0], { status: 'CLOSING_ISSUE' })
+  Object.assign(f.database.rows[0].payload, { issue_number: '42', close_reason: 'user_resolved', next_issue_close_at: 1 })
+  f.hooks.dispose()
+  await f.hooks.ready()
+  let releaseClose, signalClose, closes = 0
+  const started = new Promise(resolve => { signalClose = resolve })
+  CNBClient.prototype.getIssue = async () => ({ state: 'open' })
+  CNBClient.prototype.closeIssue = async () => {
+    closes++
+    signalClose()
+    await new Promise(resolve => { releaseClose = resolve })
+  }
+  const [handle, timer] = [...timers][0]
+  timers.delete(handle)
+  timer.fn()
+  await started
+  const reply = f.command('resolve')
+  releaseClose()
+  assert.match(await reply, /无需重复确认/)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(closes, 1)
+  assert.equal(f.sent.length, 2, 'one initial prompt and one background success notice')
+  assert.equal(f.sent[1][0].type, 'at')
+  assert.equal(f.sent[1][0].attrs.id, 'user')
+  assert.match(f.sent[1].at(-1), /已确认解决/)
+})
+
+test('resolve cannot convert a pending timeout retry into a user confirmation', async t => {
+  const f = await fixture(t)
+  await f.command('')
+  Object.assign(f.database.rows[0], { status: 'AWAITING_RECOVERY' })
+  Object.assign(f.database.rows[0].payload, { issue_number: '42', issue_state: 'open', recovery_deadline: 1 })
+  let closes = 0
+  CNBClient.prototype.getIssue = async () => ({ state: 'open' })
+  CNBClient.prototype.closeIssue = async () => {
+    if (++closes === 1) throw new CNBNetworkError('disconnected')
+  }
+  await f.command('status')
+  assert.equal(f.database.rows[0].status, 'CLOSING_ISSUE')
+  assert.match(await f.command('resolve'), /超时自动关闭流程/)
+  assert.equal(closes, 1)
+  assert.equal(f.database.rows[0].payload.close_reason, 'recovery_timeout')
+  await f.command('status')
+  assert.equal(closes, 2)
+  assert.equal(f.database.rows[0].status, 'DONE')
+  assert.notEqual(f.database.rows[0].payload.closed_by_user, true)
+  assert.equal(f.calls.comments.length, 1)
+  assert.match(await f.command('resolve'), /已因等待确认超时自动关闭/)
+})
+
+test('recall only the upload prompt after accepting a diagnostic file; append does not recall again', async t => {
+  const f = await fixture(t)
+  assert.equal(await f.command('启动后闪退'), '')
+  assert.match(f.sent[0], /请在 10 分钟内/)
+  assert.match(f.sent[0], /Issue 标题：启动后闪退/)
+  assert.deepEqual(f.database.rows[0].payload.log_prompt_message_ids, ['message-1'])
+  f.session.elements[0].attrs.name = 'diagnostic.zip'
+  CNBClient.prototype.uploadAttachment = async () => {
+    assert.deepEqual(f.deleted, [{ channelId: 'private', messageId: 'message-1' }])
+    return { asset_link: '[log](https://cnb.cool/asset/1)' }
+  }
+  await f.hooks.message(f.session)
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.deepEqual(f.database.rows[0].payload.log_prompt_message_ids, [])
+  await f.hooks.message(f.session)
+  assert.equal(f.deleted.length, 1)
+  assert.equal(await fs.readFile(f.source, 'utf8'), 'diagnostic log')
+})
+
+test('wait for prompt message IDs when a file arrives before the prompt send completes', async t => {
+  const f = await fixture(t)
+  let finishSend, promptStarted
+  const started = new Promise(resolve => { promptStarted = resolve })
+  f.session.send = async message => {
+    f.sent.push(message)
+    if (message.startsWith('请在')) {
+      promptStarted()
+      return new Promise(resolve => { finishSend = resolve })
+    }
+    return ['receipt']
+  }
+  const command = f.command('')
+  await started
+  const upload = f.hooks.message(f.session)
+  finishSend(['prompt'])
+  await Promise.all([command, upload])
+  assert.deepEqual(f.deleted, [{ channelId: 'private', messageId: 'prompt' }])
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+})
+
+test('keep the prompt for invalid or unreadable files and recall it after a valid retry', async t => {
+  const f = await fixture(t)
+  await f.command('')
+  const validAttrs = { ...f.session.elements[0].attrs }
+  f.session.elements[0].attrs = { name: 'source.log' }
+  await f.hooks.message(f.session)
+  assert.equal(f.database.rows[0].status, 'WAITING_LOG')
+  assert.deepEqual(f.deleted, [])
+  f.session.elements[0].attrs = { ...validAttrs, name: 'program.exe' }
+  await f.hooks.message(f.session)
+  assert.equal(f.database.rows[0].status, 'WAITING_LOG')
+  assert.deepEqual(f.deleted, [])
+  assert.deepEqual(f.database.rows[0].payload.log_prompt_message_ids, ['message-1'])
+  f.session.elements[0].attrs = validAttrs
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted, [{ channelId: 'private', messageId: 'message-1' }])
+})
+
+test('recall every prompt segment and continue submitting when the adapter rejects recall', async t => {
+  const f = await fixture(t)
+  f.session.send = async message => { f.sent.push(message); return ['prompt-a', 'prompt-b'] }
+  f.session.bot.deleteMessage = async (channelId, messageId) => {
+    f.deleted.push({ channelId, messageId })
+    throw new Error('recall time limit exceeded')
+  }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted, [
+    { channelId: 'private', messageId: 'prompt-a' },
+    { channelId: 'private', messageId: 'prompt-b' },
+  ])
+  assert.equal(f.calls.issues.length, 1)
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.deepEqual(f.database.rows[0].payload.log_prompt_message_ids, [])
+})
+
+test('persist prompt IDs across restart and scope group recall to the report owner', async t => {
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false })
+  await f.command('')
+  f.hooks.dispose()
+  await f.hooks.ready()
+  await f.hooks.message({ ...f.session, userId: 'someone-else' })
+  assert.deepEqual(f.deleted, [])
+  assert.equal(f.calls.issues.length, 0)
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted, [{ channelId: 'group', messageId: 'message-1' }])
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+})
+
+test('recall user files only after the initial Issue or appended comment is saved', async t => {
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
+  f.session.bot.deleteMessage = async (channelId, messageId) => {
+    if (messageId === 'initial-file') assert.equal(f.calls.issues.length, 1)
+    if (messageId === 'extra-file') assert.match(f.calls.comments.at(-1).body, /追加日志附件/)
+    f.deleted.push({ channelId, messageId })
+  }
+  await f.command('')
+  await f.hooks.message({ ...f.session, userId: 'someone-else', messageId: 'unrelated-file' })
+  assert.deepEqual(f.deleted, [])
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted, [
+    { channelId: 'group', messageId: 'message-1' },
+    { channelId: 'group', messageId: 'initial-file' },
+  ])
+  assert.equal(f.database.rows[0].payload.source_message_id, '')
+  f.session.messageId = 'extra-file'
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted.at(-1), { channelId: 'group', messageId: 'extra-file' })
+  assert.equal(f.deleted.length, 3)
+})
+
+test('file recall denied by the platform does not interrupt initial or appended submissions', async t => {
+  const f = await fixture(t)
+  f.session.messageId = 'initial-file'
+  f.session.bot.deleteMessage = async (channelId, messageId) => {
+    f.deleted.push({ channelId, messageId })
+    throw new Error('permission denied')
+  }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.equal(f.calls.issues.length, 1)
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  f.session.messageId = 'extra-file'
+  await f.hooks.message(f.session)
+  assert.match(f.sent.at(-1), /日志已追加到 Issue/)
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1', 'initial-file', 'extra-file'])
+})
+
+test('keep user files when initial Issue creation fails even after a successful upload', async t => {
+  const f = await fixture(t)
+  f.session.messageId = 'initial-file'
+  await f.command('')
+  CNBClient.prototype.createIssue = async () => { throw new CNBAPIError('rejected', 403) }
+  await f.hooks.message(f.session)
+  assert.equal(f.calls.uploads.length, 1)
+  assert.equal(f.database.rows[0].status, 'FAILED')
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+})
+
+test('keep user files on failed or uncertain appended comments and invalid attachments', async t => {
+  const f = await fixture(t)
+  await f.command('')
+  await f.hooks.message(f.session)
+  f.session.messageId = 'extra-file'
+  for (const error of [new CNBAPIError('rejected', 403), new CNBNetworkError('disconnected')]) {
+    CNBClient.prototype.createComment = async () => { throw error }
+    await f.hooks.message(f.session)
+    assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+  }
+  f.session.elements[0].attrs.name = 'program.exe'
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+})
 
 test('delete uploaded copies before creating Issue; append logs to the same Issue', async t => {
   const f = await fixture(t)

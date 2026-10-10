@@ -138,6 +138,36 @@ export function apply(ctx: Context, input: PluginConfig) {
     }
   }
 
+  async function recallLogPrompt(session: Session, id: string) {
+    try {
+      await lock(`log-prompt:${id}`, async () => {
+        const task = await store.get(id)
+        if (!task?.log_prompt_message_ids?.length) return
+        for (const messageId of task.log_prompt_message_ids) {
+          try {
+            await session.bot.deleteMessage(task.channel_id, messageId)
+          } catch (error) {
+            log.warn('撤回报障 %s 的上传提示失败：%s', id, errorText(error))
+          }
+        }
+        await store.update(id, { log_prompt_message_ids: [] })
+      })
+    } catch (error) {
+      log.warn('清理报障 %s 的上传提示失败，继续提交日志：%s', id, errorText(error))
+    }
+  }
+
+  async function recallAttachmentMessage(task: Report, messageId?: string, session?: Session) {
+    if (!messageId) return
+    try {
+      const bot = session?.bot || ctx.bots.find(bot => bot.platform === task.platform && bot.selfId === task.bot_id)
+      if (!bot) return
+      await bot.deleteMessage(task.channel_id, messageId)
+    } catch (error) {
+      log.debug('撤回报障 %s 的文件消息失败（可能无权限或超时）：%s', task.id, errorText(error))
+    }
+  }
+
   function formatTaskStatus(task: Report) {
     const label = task.status === 'UNCERTAIN' && task.uncertain_kind === 'issue_creation'
       ? '需要管理员核对'
@@ -209,7 +239,7 @@ export function apply(ctx: Context, input: PluginConfig) {
     return updated
   }
 
-  async function createIssueFromPrepared(id: string): Promise<string> {
+  async function createIssueFromPrepared(id: string, session?: Session): Promise<string> {
     return lock(id, async () => {
       let task = await store.get(id)
       if (!task || task.status !== 'CREATING_ISSUE') return '这份日志已在处理中，或报障已结束。'
@@ -255,15 +285,18 @@ export function apply(ctx: Context, input: PluginConfig) {
           issueBody(task, { asset_link: String(task.asset_link) }, stat.size, String(task.source_file_suffix)),
         )
         const number = String(issue.number)
+        const sourceMessageId = task.source_message_id
         task = await store.update(id, {
           issue_number: number,
           issue_url: String(issue.html_url || client.issueUrl(number)),
           external_phase: 'trigger_comment',
           prepared_path: '',
           source_filename: '',
+          source_message_id: '',
           file_bytes: 0,
         }, 'TRIGGERING_NPC', false, ['CREATING_ISSUE']) || task
         if (task.status !== 'TRIGGERING_NPC') return 'Issue 已创建，但报障已取消。'
+        await recallAttachmentMessage(task, sourceMessageId, session)
       } catch (error) {
         if (ambiguous(error)) {
           const uncertain = await setUncertain(task, 'issue_creation', '创建 Issue 时连接中断，无法确认 Issue 是否已创建。')
@@ -354,15 +387,17 @@ export function apply(ctx: Context, input: PluginConfig) {
       )
       const prepared = join(preparedDir, `${task.id}${staged.suffix}`)
       await fs.rename(temporary, prepared)
-      await store.update(task.id, {
+      const updated = await store.update(task.id, {
         prepared_path: prepared,
         source_filename: staged.name,
+        source_message_id: session.messageId || '',
         source_file_suffix: staged.suffix,
         file_bytes: staged.size,
         external_phase: 'prepared',
         last_error: '',
       }, 'CREATING_ISSUE', false, ['PREPARING_LOG'])
-      const notice = await createIssueFromPrepared(task.id)
+      if (updated?.status === 'CREATING_ISSUE') await recallLogPrompt(session, task.id)
+      const notice = await createIssueFromPrepared(task.id, session)
       await session.send(notice)
     } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => {})
@@ -379,6 +414,7 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function appendAttachment(task: Report, file: any, session: Session): Promise<string> {
+    const sourceMessageId = session.messageId
     return lock(`attachment:${task.id}`, async () => {
       const current = await store.get(task.id)
       if (!current?.issue_number || !['WAITING_NPC', 'AWAITING_RECOVERY'].includes(current.status)) {
@@ -402,6 +438,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         }
         await client.createComment(String(current.issue_number),
           `## 追加日志附件\n\n${issueBody(current, asset, staged.size, staged.suffix)}`)
+        await recallAttachmentMessage(current, sourceMessageId, session)
         return `日志已追加到 Issue。补充完后发送 debug analyze，请${config.assistant_name}重新分析。\nIssue：${current.issue_url}`
       } catch (error) {
         if (ambiguous(error)) return `追加日志提交结果不确定，请检查 Issue 后再决定是否重发。\nIssue：${current.issue_url}`
@@ -682,17 +719,39 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function resolveTask(task: Report, announce: boolean) {
+    return lock(`issue-close:${task.id}`, async () => {
+      const latest = await store.get(task.id)
+      if (!latest) return '找不到这条报障记录。'
+      return resolveTaskLocked(latest, announce)
+    })
+  }
+
+  function completedNotice(task: Report) {
+    if (task.close_reason === 'recovery_timeout') {
+      return '此报障已因等待确认超时自动关闭，未记录为已解决。如需继续排查，请重新发送 debug。'
+    }
+    return task.closed_by_user
+      ? '此报障已确认解决，Issue 已关闭，无需重复确认。'
+      : '此报障的 Issue 已关闭，报障已结束。'
+  }
+
+  async function resolveTaskLocked(task: Report, announce: boolean) {
+    if (task.status === 'DONE') return completedNotice(task)
+    if (task.status === 'CLOSING_ISSUE' && task.close_reason === 'recovery_timeout') {
+      return '此报障已进入超时自动关闭流程，未记录为已解决。如需继续排查，请重新发送 debug。'
+    }
     if (task.status !== 'AWAITING_RECOVERY' && task.status !== 'CLOSING_ISSUE') {
       return `当前状态为“${STATUS_LABELS[task.status]}”，暂时不能确认解决。`
     }
-    const closing = await store.update(task.id, { next_issue_close_at: now() }, 'CLOSING_ISSUE', false, ['AWAITING_RECOVERY', 'CLOSING_ISSUE']) || task
-    if (closing.status !== 'CLOSING_ISSUE') return '报障状态已变化，请发送 debug status 查看进度。'
+    const closing = task.status === 'CLOSING_ISSUE' ? task : await store.transition(task.id,
+      'CLOSING_ISSUE', ['AWAITING_RECOVERY'], { close_reason: 'user_resolved', next_issue_close_at: now() })
+    if (!closing) return '报障状态已变化，请发送 debug status 查看进度。'
     try {
       const client = clientFor(String(task.repository || config.cnb_repository))
       const issue = await client.getIssue(String(task.issue_number))
       if (String(issue.state || '').toLowerCase() !== 'closed') await client.closeIssue(String(task.issue_number))
-      const done = await store.update(task.id, { issue_state: 'closed', closed_by_user: true }, 'DONE', true, ['CLOSING_ISSUE'])
-      if (done?.status !== 'DONE') return '报障状态已变化，请发送 debug status 查看进度。'
+      const done = await store.transition(task.id, 'DONE', ['CLOSING_ISSUE'], { issue_state: 'closed', closed_by_user: true }, true)
+      if (!done) return '报障状态已变化，请发送 debug status 查看进度。'
       if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
       if (announce) await notify(closing, '已确认解决，报障结束，Issue 已关闭。感谢反馈！', !task.direct)
       return '已确认解决，报障结束，Issue 已关闭。感谢反馈！'
@@ -707,11 +766,18 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function syncIssue(task: Report) {
+    return lock(`issue-close:${task.id}`, async () => {
+      const latest = await store.get(task.id)
+      if (latest?.status === 'AWAITING_RECOVERY') await syncIssueLocked(latest)
+    })
+  }
+
+  async function syncIssueLocked(task: Report) {
     try {
       const issue = await clientFor(String(task.repository || config.cnb_repository)).getIssue(String(task.issue_number))
       if (String(issue.state || '').toLowerCase() === 'closed') {
-        const done = await store.update(task.id, { issue_state: 'closed' }, 'DONE', true, ['AWAITING_RECOVERY'])
-        if (done?.status === 'DONE') await notify(task, 'CNB Issue 已关闭，报障结束。')
+        const done = await store.transition(task.id, 'DONE', ['AWAITING_RECOVERY'], { issue_state: 'closed' }, true)
+        if (done) await notify(task, 'CNB Issue 已关闭，报障结束。')
         return
       }
       if (now() >= Number(task.recovery_deadline || 0)) {
@@ -720,8 +786,8 @@ export function apply(ctx: Context, input: PluginConfig) {
           String(task.issue_number),
           `报障人在 ${timeout} 分钟内没有确认问题是否解决，插件已自动关闭此 Issue。问题可能仍未解决。`,
         )
-        const closing = await store.update(task.id, { close_reason: 'recovery_timeout', next_issue_close_at: now() }, 'CLOSING_ISSUE', false, ['AWAITING_RECOVERY'])
-        if (closing?.status === 'CLOSING_ISSUE') await closeAfterTimeout(closing)
+        const closing = await store.transition(task.id, 'CLOSING_ISSUE', ['AWAITING_RECOVERY'], { close_reason: 'recovery_timeout', next_issue_close_at: now() })
+        if (closing) await closeAfterTimeoutLocked(closing)
       } else {
         await store.update(task.id, {
           issue_state: 'open', next_issue_check_at: now() + seconds(config.issue_check_interval_seconds, 30, 5, 300),
@@ -739,10 +805,19 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function closeAfterTimeout(task: Report) {
+    return lock(`issue-close:${task.id}`, async () => {
+      const latest = await store.get(task.id)
+      if (latest?.status === 'CLOSING_ISSUE' && latest.close_reason === 'recovery_timeout') {
+        await closeAfterTimeoutLocked(latest)
+      }
+    })
+  }
+
+  async function closeAfterTimeoutLocked(task: Report) {
     try {
       await clientFor(String(task.repository || config.cnb_repository)).closeIssue(String(task.issue_number))
-      const done = await store.update(task.id, { issue_state: 'closed' }, 'DONE', true, ['CLOSING_ISSUE'])
-      if (done?.status === 'DONE') await notify(task, '等待确认超时，Issue 已自动关闭。')
+      const done = await store.transition(task.id, 'DONE', ['CLOSING_ISSUE'], { issue_state: 'closed' }, true)
+      if (done) await notify(task, '等待确认超时，Issue 已自动关闭。')
     } catch (error) {
       await store.update(task.id, {
         next_issue_close_at: now() + 30,
@@ -887,7 +962,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       }
       const arg = String(argument || '').trim()
       const subcommand = findSubcommand(arg)
-      if (!arg || subcommand === 'start') return await startReport(scope, arg && subcommand !== 'start' ? arg : '')
+      if (!arg || subcommand === 'start') return await startReport(session, scope, arg && subcommand !== 'start' ? arg : '')
       if (subcommand === 'help') return helpText(privateChat, config.assistant_name)
       const guess = likelyTypo(arg)
       if (!subcommand && guess) return `没有 debug ${arg} 这个指令，你是不是想发送 debug ${guess}？\n如果这是故障描述，请写得更具体一些，例如：debug 启动后闪退。\n发送 debug help 查看全部指令。`
@@ -926,11 +1001,11 @@ export function apply(ctx: Context, input: PluginConfig) {
           ? `报障已取消；已创建的 Issue 保留：${latest.issue_url}`
           : '报障已取消。'
       }
-      if (!task || TERMINAL.has(task.status)) return await startReport(scope, arg)
-      return await startReport(scope, arg)
+      if (!task || TERMINAL.has(task.status)) return await startReport(session, scope, arg)
+      return await startReport(session, scope, arg)
     })
 
-  async function startReport(scope: Scope, issueTitle = ''): Promise<string> {
+  async function startReport(session: Session, scope: Scope, issueTitle = ''): Promise<string> {
     const existing = await store.findActive(scope)
     if (existing) {
       return `你在这里已有一个未结束的报障（${statusLabel(existing)}）。\n发送 debug status 查看进度，或 debug cancel 取消后重新开始。`
@@ -975,7 +1050,11 @@ export function apply(ctx: Context, input: PluginConfig) {
     rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可继续上传日志，或${scope.direct ? '直接私信' : '@我'}补充信息。`)
     rows.push('注意：文件会原样提交到 CNB 仓库，不会读取或脱敏，请确认不含隐私内容。')
     rows.push('debug cancel 取消 · debug help 查看帮助')
-    return rows.join('\n')
+    await lock(`log-prompt:${task.id}`, async () => {
+      const messageIds = await session.send(rows.join('\n'))
+      if (messageIds?.length) await store.update(task.id, { log_prompt_message_ids: messageIds })
+    })
+    return ''
   }
 
   async function refresh(task: Report) {

@@ -60,6 +60,8 @@ export interface Report {
   created_at: number
   updated_at: number
   deadline: number
+  log_prompt_message_ids?: string[]
+  source_message_id?: string
   revision?: number
   [key: string]: any
 }
