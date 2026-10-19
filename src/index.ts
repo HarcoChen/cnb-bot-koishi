@@ -1,3 +1,4 @@
+import { formatAnalysis, analysisSummary } from './analysis'
 import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
@@ -76,7 +77,7 @@ export function apply(ctx: Context, input: PluginConfig) {
   let ticking = false
   const locks = new Map<string, Promise<unknown>>()
   const groupWhitelist = configValues(config.group_whitelist)
-  const acceptedLogTypes = '.zip、.log、.json、.txt、.yaml、.yml、.xml、.csv 等常见诊断文件'
+  const acceptedLogTypes = '日志或诊断文件'
   const privateWhitelist = configValues(config.private_whitelist)
   const fileHostAllowlist = configValues(config.file_url_host_allowlist)
   const trustedIds = configValues(config.npc_author_ids)
@@ -366,7 +367,7 @@ export function apply(ctx: Context, input: PluginConfig) {
 
   async function processAttachment(session: Session, scope: Scope, file: any, task: Report) {
     if (!(await store.claimLog(task))) return
-    try { await session.send('已收到日志，正在提交，请稍候…') } catch (error) {
+    try { await session.send('正在提交日志…') } catch (error) {
       log.warn('发送日志接收回执失败，继续处理报障 %s：%s', task.id, errorText(error))
     }
     const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
@@ -439,7 +440,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         await client.createComment(String(current.issue_number),
           `## 追加日志附件\n\n${issueBody(current, asset, staged.size, staged.suffix)}`)
         await recallAttachmentMessage(current, sourceMessageId, session)
-        return `日志已追加到 Issue。补充完后发送 debug analyze，请${config.assistant_name}重新分析。\nIssue：${current.issue_url}`
+        return `日志已追加，补充完后发送 debug analyze 重新分析。`
       } catch (error) {
         if (ambiguous(error)) return `追加日志提交结果不确定，请检查 Issue 后再决定是否重发。\nIssue：${current.issue_url}`
         return `追加日志失败：${errorText(error)}`
@@ -464,7 +465,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       return `补充信息提交失败：${errorText(error)}`
     }
     return task.status === 'WAITING_NPC' || task.status === 'AWAITING_RECOVERY'
-      ? `已补充到 Issue。\n补充完后发送 debug analyze，让${config.assistant_name}结合新信息重新分析。`
+      ? `已补充到 Issue，发送 debug analyze 重新分析。`
       : '已补充到 Issue。'
   }
 
@@ -519,7 +520,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         next_poll_at: now() + seconds(config.poll_interval_seconds, 10, 5, 120),
         external_phase: '',
       }, 'WAITING_NPC', false, ['TRIGGERING_NPC'])
-      return `${config.assistant_name}已收到重新分析请求，通常需要几分钟。\nIssue：${task.issue_url}`
+      return `已请求${config.assistant_name}重新分析，请稍候。`
     } catch (error) {
       if (ambiguous(error)) {
         await store.update(task.id, {
@@ -676,7 +677,7 @@ export function apply(ctx: Context, input: PluginConfig) {
 
   function recoveryPrompt(task: Report) {
     const how = task.direct ? '直接私信我' : '@我'
-    return `结论：${task.analysis_summary || '已返回分析，详见上方。'}\n\n问题解决了吗？\n· 已解决：发送 debug resolve\n· 没解决：${how}补充现象，再发送 debug analyze 重新分析`
+    return `结论：${task.analysis_summary || '已返回分析，详见上方。'}\n\n已解决：debug resolve\n未解决：${how}补充现象，再发 debug analyze`
   }
 
   async function finish(task: Report, status: Status, message: string, extra: Record<string, any> = {}, expected: Status[] = [task.status]) {
@@ -1047,9 +1048,9 @@ export function apply(ctx: Context, input: PluginConfig) {
     const rows = [`请在 ${ttl}内${scope.direct ? '' : '由你本人在本群'}上传一个${acceptedLogTypes}。`]
     if (config.log_location_hint.trim()) rows.push(config.log_location_hint.trim())
     if (task.issue_title) rows.push(`Issue 标题：${task.issue_title}`)
-    rows.push(`上传后会创建 Issue 并请${config.assistant_name}分析；之后可继续上传日志，或${scope.direct ? '直接私信' : '@我'}补充信息。`)
-    rows.push('注意：文件会原样提交到 CNB 仓库，不会读取或脱敏，请确认不含隐私内容。')
-    rows.push('debug cancel 取消 · debug help 查看帮助')
+    rows.push(`上传后由${config.assistant_name}分析；可追加文件或${scope.direct ? '直接私信' : '@我'}补充说明。`)
+    rows.push('文件原样上传 CNB，不做脱敏，请勿包含隐私。')
+    rows.push('取消：debug cancel · 帮助：debug help')
     await lock(`log-prompt:${task.id}`, async () => {
       const messageIds = await session.send(rows.join('\n'))
       if (messageIds?.length) await store.update(task.id, { log_prompt_message_ids: messageIds })
@@ -1180,49 +1181,7 @@ function statusLabel(task: Report) {
 }
 
 function submittedNotice(task: Report) {
-  return `日志已提交，${task.assistant_name || '分析助手'}正在分析，通常需要几分钟（最长 ${formatDuration(Number(task.analysis_deadline || now()) - Number(task.trigger_at || now()))}）。\nIssue：${task.issue_url}\n可发送 debug status 查看进度。`
-}
-
-function formatAnalysis(body: string) {
-  const lines = body.trim().split(/\r?\n/)
-  let summaryIndex = -1
-  let detailIndex = -1
-  let summaryInline = ''
-  let detailInline = ''
-  lines.forEach((line, index) => {
-    const found = analysisHeading(line)
-    if (!found) return
-    if (found.label === '一句话描述' && summaryIndex < 0) { summaryIndex = index; summaryInline = found.inline }
-    if (found.label === '详细分析' && detailIndex < 0) { detailIndex = index; detailInline = found.inline }
-  })
-  if (summaryIndex >= 0 && detailIndex > summaryIndex) {
-    const summary = [...(summaryInline ? [summaryInline] : []), ...lines.slice(summaryIndex + 1, detailIndex)].join('\n').trim()
-    const detail = [...lines.slice(0, summaryIndex), ...(detailInline ? [detailInline] : []), ...lines.slice(detailIndex + 1)].join('\n').trim()
-    if (summary && detail) return `【一句话描述】\n${summary}\n\n【详细分析】\n${detail}`
-  }
-  const first = lines.find(line => line.trim())?.trim() || body.trim()
-  const cleaned = first.replace(/^\s{0,3}#{1,6}\s*/, '').replace(/^\s*[-*]\s+/, '').trim()
-  const end = cleaned.search(/[。！？!?](?:[”’」』）】]*)/)
-  const summary = end >= 0 ? cleaned.slice(0, end + 1) : cleaned
-  return `【一句话描述】\n${summary || '已返回分析，详见下方。'}\n\n【详细分析】\n${body.trim()}`
-}
-
-function analysisHeading(line: string) {
-  const text = line.replace(/^\s{0,3}#{1,6}\s*/, '').replace(/\*\*/g, '').trim()
-  for (const label of ['一句话描述', '详细分析']) {
-    if (text === label) return { label, inline: '' }
-    if (text.startsWith(`${label}：`) || text.startsWith(`${label}:`)) {
-      return { label, inline: text.slice(label.length + 1).trim() }
-    }
-  }
-}
-
-function analysisSummary(body: string) {
-  const formatted = formatAnalysis(body)
-  const match = formatted.match(/【一句话描述】\s*([\s\S]*?)\s*【详细分析】/)
-  const value = (match?.[1] || '').replace(/\s+/g, ' ').trim()
-  const end = value.search(/[。！？!?](?:[”’」』）】]*)/)
-  return end >= 0 ? value.slice(0, end + 1) : value || '已返回分析，详见合并转发。'
+  return `日志已提交，${task.assistant_name || '分析助手'}分析中（最长 ${formatDuration(Number(task.analysis_deadline || now()) - Number(task.trigger_at || now()))}）。\nIssue：${task.issue_url}\n进度：debug status`
 }
 
 function likelyTypo(argument: string) {

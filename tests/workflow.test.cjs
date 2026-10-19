@@ -334,7 +334,7 @@ test('file recall denied by the platform does not interrupt initial or appended 
   assert.equal(f.database.rows[0].status, 'WAITING_NPC')
   f.session.messageId = 'extra-file'
   await f.hooks.message(f.session)
-  assert.match(f.sent.at(-1), /日志已追加到 Issue/)
+  assert.match(f.sent.at(-1), /日志已追加.*debug analyze/)
   assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1', 'initial-file', 'extra-file'])
 })
 
