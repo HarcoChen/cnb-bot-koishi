@@ -56,10 +56,12 @@ async function fixture(t, config = {}) {
   let action
   const sent = []
   const deleted = []
+  const logs = []
   const ctx = {
     baseDir, database,
     model: { extend() {} },
-    logger: () => ({ warn() {}, debug() {}, info() {} }),
+    logger: () => Object.fromEntries(['warn', 'debug', 'info'].map(level =>
+      [level, (...args) => logs.push({ level, args })])),
     bots: [],
     command: () => ({ action(fn) { action = fn } }),
     on(event, fn) { hooks[event] = fn },
@@ -99,7 +101,7 @@ async function fixture(t, config = {}) {
     return { id: String(calls.comments.length) }
   }
   await hooks.ready()
-  return { database, hooks, session, source, calls, sent, deleted,
+  return { database, hooks, session, source, calls, sent, deleted, logs,
     command: (arg, sessionOverride = session) => action({ session: sessionOverride }, arg) }
 }
 
@@ -336,7 +338,59 @@ test('file recall denied by the platform does not interrupt initial or appended 
   await f.hooks.message(f.session)
   assert.match(f.sent.at(-1), /日志已追加.*debug analyze/)
   assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1', 'initial-file', 'extra-file'])
+  assert.ok(f.logs.some(entry => entry.level === 'warn'
+    && /文件消息失败/.test(entry.args[0]) && entry.args.includes('permission denied')))
 })
+
+for (const stage of ['prompt', 'initial-file', 'appended-file']) {
+  test(`a hanging ${stage} recall times out and lets diagnostic processing finish`, { timeout: 2000 }, async t => {
+    const originalSetTimeout = global.setTimeout
+    const originalClearTimeout = global.clearTimeout
+    const timers = new Map()
+    global.setTimeout = (fn, delay, ...args) => {
+      if (delay !== 5000) return originalSetTimeout(fn, delay, ...args)
+      const handle = {}
+      timers.set(handle, fn)
+      return handle
+    }
+    global.clearTimeout = handle => {
+      if (!timers.delete(handle)) originalClearTimeout(handle)
+    }
+    t.after(() => { global.setTimeout = originalSetTimeout; global.clearTimeout = originalClearTimeout })
+    const f = await fixture(t)
+    await f.command('')
+    if (stage === 'appended-file') await f.hooks.message(f.session)
+    f.session.messageId = stage === 'prompt' ? undefined : stage
+    let signalRecall, rejectRecall
+    const started = new Promise(resolve => { signalRecall = resolve })
+    const stuckId = stage === 'prompt' ? 'message-1' : stage
+    const originalDelete = f.session.bot.deleteMessage
+    f.session.bot.deleteMessage = async (channelId, messageId) => {
+      if (messageId !== stuckId) return originalDelete(channelId, messageId)
+      if (stage === 'initial-file') assert.equal(f.calls.issues.length, 1)
+      if (stage === 'appended-file') assert.match(f.calls.comments.at(-1).body, /追加日志附件/)
+      signalRecall()
+      return new Promise((_, reject) => { rejectRecall = reject })
+    }
+    const upload = f.hooks.message(f.session)
+    await started
+    assert.equal(timers.size, 1, 'the stuck recall must have a timeout')
+    const expire = [...timers.values()][0]
+    expire()
+    await upload
+    assert.equal(timers.size, 0, 'the timeout timer must be cleaned up')
+    assert.equal(f.calls.issues.length, 1)
+    assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+    assert.ok(f.logs.some(entry => entry.level === 'warn' && entry.args.includes('撤回消息超时。')),
+      'recall timeouts must be visible at the normal warning level')
+    if (stage === 'prompt') assert.deepEqual(f.database.rows[0].payload.log_prompt_message_ids, [])
+    if (stage === 'initial-file') assert.equal(f.calls.comments.length, 1, 'analysis must still be requested')
+    if (stage === 'appended-file') assert.match(f.sent.at(-1), /日志已追加.*debug analyze/)
+    rejectRecall(new Error('late permission denied'))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  })
+}
 
 test('keep user files when initial Issue creation fails even after a successful upload', async t => {
   const f = await fixture(t)

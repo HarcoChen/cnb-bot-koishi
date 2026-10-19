@@ -144,9 +144,11 @@ export function apply(ctx: Context, input: PluginConfig) {
       await lock(`log-prompt:${id}`, async () => {
         const task = await store.get(id)
         if (!task?.log_prompt_message_ids?.length) return
+        log.info('报障 %s：开始撤回上传提示。', id)
         for (const messageId of task.log_prompt_message_ids) {
           try {
-            await session.bot.deleteMessage(task.channel_id, messageId)
+            await withTimeout(session.bot.deleteMessage(task.channel_id, messageId), 5000, '撤回消息超时。')
+            log.info('报障 %s：已撤回上传提示。', id)
           } catch (error) {
             log.warn('撤回报障 %s 的上传提示失败：%s', id, errorText(error))
           }
@@ -159,13 +161,21 @@ export function apply(ctx: Context, input: PluginConfig) {
   }
 
   async function recallAttachmentMessage(task: Report, messageId?: string, session?: Session) {
-    if (!messageId) return
+    if (!messageId) {
+      log.info('报障 %s：适配器未提供文件消息 ID，跳过撤回。', task.id)
+      return
+    }
     try {
       const bot = session?.bot || ctx.bots.find(bot => bot.platform === task.platform && bot.selfId === task.bot_id)
-      if (!bot) return
-      await bot.deleteMessage(task.channel_id, messageId)
+      if (!bot) {
+        log.warn('报障 %s：找不到原机器人，跳过文件消息撤回。', task.id)
+        return
+      }
+      log.info('报障 %s：开始撤回文件消息，最多等待 5 秒。', task.id)
+      await withTimeout(bot.deleteMessage(task.channel_id, messageId), 5000, '撤回消息超时。')
+      log.info('报障 %s：已撤回文件消息。', task.id)
     } catch (error) {
-      log.debug('撤回报障 %s 的文件消息失败（可能无权限或超时）：%s', task.id, errorText(error))
+      log.warn('撤回报障 %s 的文件消息失败，继续处理（可能无权限或超时）：%s', task.id, errorText(error))
     }
   }
 
@@ -236,6 +246,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       prepared_path: '',
     }, 'UNCERTAIN', false, [kind === 'issue_creation' ? 'CREATING_ISSUE' : 'TRIGGERING_NPC'])
     if (!updated || updated.status !== 'UNCERTAIN') return updated
+    log.warn('报障 %s：提交结果不确定（%s）：%s', task.id, kind, message)
     if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
     return updated
   }
@@ -259,8 +270,10 @@ export function apply(ctx: Context, input: PluginConfig) {
 
       try {
         if (!alreadyUploaded) {
+          log.info('报障 %s：开始上传诊断文件到 CNB（%s 字节）。', id, stat.size)
           task = await store.update(id, { external_phase: 'asset_upload' }, undefined, false, ['CREATING_ISSUE']) || task
           const asset = await client.uploadAttachment(path, String(task.source_filename || basename(path)), stat.size)
+          log.info('报障 %s：诊断文件已上传到 CNB。', id)
           // Persist the remote reference before discarding the resumable local copy.
           task = await store.update(id, {
             external_phase: 'asset_uploaded', asset_link: asset.asset_link, prepared_path: '',
@@ -281,6 +294,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       try {
         task = await store.update(id, { external_phase: 'issue_create' }, undefined, false, ['CREATING_ISSUE']) || task
         if (task.status !== 'CREATING_ISSUE') return '报障已取消。'
+        log.info('报障 %s：开始创建 CNB Issue。', id)
         const issue = await client.createIssue(
           createIssueTitle(task),
           issueBody(task, { asset_link: String(task.asset_link) }, stat.size, String(task.source_file_suffix)),
@@ -297,6 +311,7 @@ export function apply(ctx: Context, input: PluginConfig) {
           file_bytes: 0,
         }, 'TRIGGERING_NPC', false, ['CREATING_ISSUE']) || task
         if (task.status !== 'TRIGGERING_NPC') return 'Issue 已创建，但报障已取消。'
+        log.info('报障 %s：已创建 CNB Issue #%s。', id, number)
         await recallAttachmentMessage(task, sourceMessageId, session)
       } catch (error) {
         if (ambiguous(error)) {
@@ -326,6 +341,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         external_phase: 'trigger_comment',
       }, 'TRIGGERING_NPC', false, ['TRIGGERING_NPC']) || task
       try {
+        log.info('报障 %s：开始提交分析请求。', id)
         const comment = await client.createComment(String(task.issue_number), trigger)
         task = await store.update(id, {
           trigger_comment_id: String(comment.id || ''),
@@ -337,6 +353,7 @@ export function apply(ctx: Context, input: PluginConfig) {
           prepared_path: '',
         }, 'WAITING_NPC', false, ['TRIGGERING_NPC']) || task
         if (task.status !== 'WAITING_NPC') return '报障已取消。'
+        log.info('报障 %s：分析请求已提交，等待分析结果。', id)
         return submittedNotice(task)
       } catch (error) {
         if (ambiguous(error)) {
@@ -360,25 +377,31 @@ export function apply(ctx: Context, input: PluginConfig) {
       delivery_parts: [],
     }, true)
     if (task.prepared_path) await fs.rm(task.prepared_path, { force: true }).catch(() => {})
-    if (updated) return updated
+    if (updated) {
+      log.warn('报障 %s：处理失败：%s', task.id, message)
+      return updated
+    }
     const latest = await store.get(task.id)
     return { ...(latest || task), last_error: latest?.last_error || message }
   }
 
   async function processAttachment(session: Session, scope: Scope, file: any, task: Report) {
     if (!(await store.claimLog(task))) return
+    log.info('报障 %s：已接收文件，开始处理。', task.id)
     try { await session.send('正在提交日志…') } catch (error) {
       log.warn('发送日志接收回执失败，继续处理报障 %s：%s', task.id, errorText(error))
     }
     const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
     const sourceName = attachmentName(file, session)
     if (!sourceUrl) {
+      log.warn('报障 %s：适配器未提供附件下载地址，等待重新上传。', task.id)
       await store.update(task.id, { last_error: '适配器没有提供附件下载地址。' }, 'WAITING_LOG', false, ['PREPARING_LOG'])
       return session.send('此 QQ 适配器没有提供可读取的文件链接，请检查适配器的群文件支持后重新上传。')
     }
     const temporary = join(tmpDir, `${task.id}.upload`)
     await fs.rm(temporary, { force: true }).catch(() => {})
     try {
+      log.info('报障 %s：开始下载并校验诊断文件。', task.id)
       const staged = await stageFile(
         sourceUrl,
         sourceName,
@@ -386,6 +409,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         Math.floor(clamp(config.max_log_file_mib, 1, 1024, 20) * 1024 * 1024),
         fileHostAllowlist,
       )
+      log.info('报障 %s：诊断文件下载并校验完成（%s 字节）。', task.id, staged.size)
       const prepared = join(preparedDir, `${task.id}${staged.suffix}`)
       await fs.rename(temporary, prepared)
       const updated = await store.update(task.id, {
@@ -401,6 +425,7 @@ export function apply(ctx: Context, input: PluginConfig) {
       const notice = await createIssueFromPrepared(task.id, session)
       await session.send(notice)
     } catch (error) {
+      log.warn('报障 %s：诊断文件处理失败：%s', task.id, errorText(error))
       await fs.rm(temporary, { force: true }).catch(() => {})
       const current = await store.get(task.id)
       if (current?.status === 'PREPARING_LOG') {
@@ -426,11 +451,13 @@ export function apply(ctx: Context, input: PluginConfig) {
       const sourceName = attachmentName(file, session)
       if (!sourceUrl) return '适配器没有提供附件下载地址，请检查适配器的文件支持。'
       try {
+        log.info('报障 %s：开始下载并校验追加诊断文件。', task.id)
         const staged = await stageFile(sourceUrl, sourceName, path,
           Math.floor(clamp(config.max_log_file_mib, 1, 1024, 20) * 1024 * 1024), fileHostAllowlist)
         const latest = await store.get(task.id)
         if (!latest || TERMINAL.has(latest.status) || latest.status === 'CLOSING_ISSUE') return '报障已结束，这份日志没有提交。'
         const client = clientFor(String(current.repository || config.cnb_repository))
+        log.info('报障 %s：开始上传追加诊断文件到 CNB（%s 字节）。', task.id, staged.size)
         const asset = await client.uploadCommentAttachment(String(current.issue_number), path, staged.name, staged.size)
         await fs.rm(path, { force: true })
         const afterUpload = await store.get(task.id)
@@ -439,9 +466,11 @@ export function apply(ctx: Context, input: PluginConfig) {
         }
         await client.createComment(String(current.issue_number),
           `## 追加日志附件\n\n${issueBody(current, asset, staged.size, staged.suffix)}`)
+        log.info('报障 %s：追加诊断文件已写入 Issue #%s。', task.id, current.issue_number)
         await recallAttachmentMessage(current, sourceMessageId, session)
         return `日志已追加，补充完后发送 debug analyze 重新分析。`
       } catch (error) {
+        log.warn('报障 %s：追加诊断文件提交失败或结果不确定：%s', task.id, errorText(error))
         if (ambiguous(error)) return `追加日志提交结果不确定，请检查 Issue 后再决定是否重发。\nIssue：${current.issue_url}`
         return `追加日志失败：${errorText(error)}`
       } finally {
@@ -599,7 +628,10 @@ export function apply(ctx: Context, input: PluginConfig) {
           next_delivery_at: now(),
         },
       )
-      if (transitioned?.status === 'DELIVERING') await deliver(transitioned)
+      if (transitioned?.status === 'DELIVERING') {
+        log.info('报障 %s：已收到验证通过的分析结果，开始发送。', task.id)
+        await deliver(transitioned)
+      }
     } catch (error) {
       if (error instanceof CNBAPIError || error instanceof CNBNetworkError) {
         const attempts = Number(task.poll_attempts || 0) + 1
@@ -1044,6 +1076,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         ? `你在这里已有一个未结束的报障（${statusLabel(conflict)}）。\n发送 debug status 查看进度，或 debug cancel 取消后重新开始。`
         : '无法创建报障记录，请稍后重试或联系管理员。'
     }
+    log.info('报障 %s：已创建，等待用户上传诊断文件。', task.id)
     const ttl = formatDuration(task.deadline - now())
     const rows = [`请在 ${ttl}内${scope.direct ? '' : '由你本人在本群'}上传一个${acceptedLogTypes}。`]
     if (config.log_location_hint.trim()) rows.push(config.log_location_hint.trim())
@@ -1275,12 +1308,12 @@ function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, ms: number, message = '发送消息超时。'): Promise<T> {
   let timer: NodeJS.Timeout | undefined
   try {
     return await Promise.race([
       promise,
-      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('发送消息超时。')), ms) }),
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) }),
     ])
   } finally {
     if (timer) clearTimeout(timer)
