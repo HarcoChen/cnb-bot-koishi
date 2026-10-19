@@ -171,12 +171,39 @@ export function apply(ctx: Context, input: PluginConfig) {
         log.warn('报障 %s：找不到原机器人，跳过文件消息撤回。', task.id)
         return
       }
+      if (!(await canRecallAttachmentMessage(bot, task))) return
       log.info('报障 %s：开始撤回文件消息，最多等待 5 秒。', task.id)
       await withTimeout(bot.deleteMessage(task.channel_id, messageId), 5000, '撤回消息超时。')
       log.info('报障 %s：已撤回文件消息。', task.id)
     } catch (error) {
       log.warn('撤回报障 %s 的文件消息失败，继续处理（可能无权限或超时）：%s', task.id, errorText(error))
     }
+  }
+
+  async function canRecallAttachmentMessage(bot: Session['bot'], task: Report): Promise<boolean> {
+    if (task.direct) {
+      log.info('报障 %s：私信不支持群管理权限检查，跳过用户文件消息撤回。', task.id)
+      return false
+    }
+    try {
+      log.info('报障 %s：开始检查机器人自身的群管理权限，最多等待 3 秒。', task.id)
+      const internal = (bot as any).internal
+      let roles: string[] | undefined
+      if (typeof internal?.getGroupMemberInfo === 'function') {
+        const member = await withTimeout<{ role?: string }>(
+          internal.getGroupMemberInfo(task.guild_id, task.bot_id, true), 3000, '查询机器人群管理权限超时。')
+        if (member?.role) roles = [member.role]
+      } else if (typeof bot.getGuildMember === 'function') {
+        const member = await withTimeout(bot.getGuildMember(task.guild_id, task.bot_id), 3000, '查询机器人群管理权限超时。')
+        if (Array.isArray(member?.roles)) roles = member.roles.map(role => role.id)
+      }
+      if (roles?.some(role => role === 'admin' || role === 'owner')) return true
+      log.info('报障 %s：%s，跳过用户文件消息撤回。', task.id,
+        roles?.includes('member') ? '机器人没有群管理权限' : '无法确认机器人具有群管理权限')
+    } catch (error) {
+      log.warn('报障 %s：查询机器人群管理权限失败，跳过用户文件消息撤回：%s', task.id, errorText(error))
+    }
+    return false
   }
 
   function formatTaskStatus(task: Report) {
@@ -312,7 +339,8 @@ export function apply(ctx: Context, input: PluginConfig) {
         }, 'TRIGGERING_NPC', false, ['CREATING_ISSUE']) || task
         if (task.status !== 'TRIGGERING_NPC') return 'Issue 已创建，但报障已取消。'
         log.info('报障 %s：已创建 CNB Issue #%s。', id, number)
-        await recallAttachmentMessage(task, sourceMessageId, session)
+        // Chat cleanup must never delay requesting analysis for the saved Issue.
+        void recallAttachmentMessage(task, sourceMessageId, session)
       } catch (error) {
         if (ambiguous(error)) {
           const uncertain = await setUncertain(task, 'issue_creation', '创建 Issue 时连接中断，无法确认 Issue 是否已创建。')
@@ -388,9 +416,9 @@ export function apply(ctx: Context, input: PluginConfig) {
   async function processAttachment(session: Session, scope: Scope, file: any, task: Report) {
     if (!(await store.claimLog(task))) return
     log.info('报障 %s：已接收文件，开始处理。', task.id)
-    try { await session.send('正在提交日志…') } catch (error) {
+    void withTimeout(Promise.resolve().then(() => session.send('正在提交日志…')), 5000).catch(error => {
       log.warn('发送日志接收回执失败，继续处理报障 %s：%s', task.id, errorText(error))
-    }
+    })
     const sourceUrl = String(file.attrs?.url || file.attrs?.src || '')
     const sourceName = attachmentName(file, session)
     if (!sourceUrl) {
@@ -421,7 +449,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         external_phase: 'prepared',
         last_error: '',
       }, 'CREATING_ISSUE', false, ['PREPARING_LOG'])
-      if (updated?.status === 'CREATING_ISSUE') await recallLogPrompt(session, task.id)
+      if (updated?.status === 'CREATING_ISSUE') void recallLogPrompt(session, task.id)
       const notice = await createIssueFromPrepared(task.id, session)
       await session.send(notice)
     } catch (error) {
@@ -467,7 +495,7 @@ export function apply(ctx: Context, input: PluginConfig) {
         await client.createComment(String(current.issue_number),
           `## 追加日志附件\n\n${issueBody(current, asset, staged.size, staged.suffix)}`)
         log.info('报障 %s：追加诊断文件已写入 Issue #%s。', task.id, current.issue_number)
-        await recallAttachmentMessage(current, sourceMessageId, session)
+        void recallAttachmentMessage(current, sourceMessageId, session)
         return `日志已追加，补充完后发送 debug analyze 重新分析。`
       } catch (error) {
         log.warn('报障 %s：追加诊断文件提交失败或结果不确定：%s', task.id, errorText(error))

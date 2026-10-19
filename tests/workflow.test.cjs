@@ -57,6 +57,7 @@ async function fixture(t, config = {}) {
   const sent = []
   const deleted = []
   const logs = []
+  const roleQueries = []
   const ctx = {
     baseDir, database,
     model: { extend() {} },
@@ -78,7 +79,13 @@ async function fixture(t, config = {}) {
   await fs.writeFile(source, 'diagnostic log')
   const session = {
     platform: 'test', selfId: 'bot', userId: 'user', channelId: 'private', isDirect: true,
-    bot: { async deleteMessage(channelId, messageId) { deleted.push({ channelId, messageId }) } },
+    bot: {
+      async deleteMessage(channelId, messageId) { deleted.push({ channelId, messageId }) },
+      async getGuildMember(guildId, userId) {
+        roleQueries.push({ guildId, userId })
+        return { roles: [{ id: 'admin' }] }
+      },
+    },
     elements: [{ type: 'file', attrs: { name: 'source.log', url: pathToFileURL(source).href } }],
     async send(message) { sent.push(message); return [`message-${sent.length}`] },
   }
@@ -101,7 +108,7 @@ async function fixture(t, config = {}) {
     return { id: String(calls.comments.length) }
   }
   await hooks.ready()
-  return { database, hooks, session, source, calls, sent, deleted, logs,
+  return { database, hooks, session, source, calls, sent, deleted, logs, roleQueries,
     command: (arg, sessionOverride = session) => action({ session: sessionOverride }, arg) }
 }
 
@@ -321,11 +328,102 @@ test('recall user files only after the initial Issue or appended comment is save
   await f.hooks.message(f.session)
   assert.deepEqual(f.deleted.at(-1), { channelId: 'group', messageId: 'extra-file' })
   assert.equal(f.deleted.length, 3)
+  assert.deepEqual(f.roleQueries, [
+    { guildId: 'group', userId: 'bot' },
+    { guildId: 'group', userId: 'bot' },
+  ])
+})
+
+for (const role of ['member', 'admin', 'owner', undefined]) {
+  test(`OneBot role ${role} determines whether user files can be recalled`, async t => {
+    const f = await fixture(t, { group_whitelist: ['group'] })
+    Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
+    const queries = []
+    f.session.bot.internal = { async getGroupMemberInfo(...args) { queries.push(args); return { role } } }
+    await f.command('')
+    await f.hooks.message(f.session)
+    f.session.messageId = 'extra-file'
+    await f.hooks.message(f.session)
+    assert.deepEqual(queries, [['group', 'bot', true], ['group', 'bot', true]])
+    assert.deepEqual(f.roleQueries, [], 'OneBot queries must take precedence over the generic API')
+    assert.deepEqual(f.deleted.map(row => row.messageId), role === 'admin' || role === 'owner'
+      ? ['message-1', 'initial-file', 'extra-file'] : ['message-1'])
+    assert.equal(f.calls.issues.length, 1)
+    assert.equal(f.calls.comments.length, 2)
+    assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+    if (role === 'member') assert.ok(f.logs.some(entry => entry.args.includes('机器人没有群管理权限')))
+  })
+}
+
+test('generic role checks detect lost administrator privileges and skip unsupported checks', async t => {
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
+  await f.command('')
+  await f.hooks.message(f.session)
+  f.session.bot.getGuildMember = async () => ({ roles: [{ id: 'member' }] })
+  f.session.messageId = 'extra-file'
+  await f.hooks.message(f.session)
+  delete f.session.bot.getGuildMember
+  f.session.messageId = 'unsupported-file'
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1', 'initial-file'])
+  assert.equal(f.calls.comments.length, 3)
+  assert.ok(f.logs.some(entry => entry.args.includes('机器人没有群管理权限')))
+  assert.ok(f.logs.some(entry => entry.args.includes('无法确认机器人具有群管理权限')))
+})
+
+test('private files skip group permission queries and user message recall', async t => {
+  const f = await fixture(t)
+  f.session.messageId = 'initial-file'
+  await f.command('')
+  await f.hooks.message(f.session)
+  f.session.messageId = 'extra-file'
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.roleQueries, [])
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+  assert.equal(f.calls.comments.length, 2)
+})
+
+test('a failed group permission query skips file recall and continues analysis', async t => {
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
+  f.session.bot.internal = { async getGroupMemberInfo() { throw new Error('unsupported API') } }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.ok(f.logs.some(entry => entry.level === 'warn' && /群管理权限失败/.test(entry.args[0])))
+})
+
+test('a hanging permission query times out without sending a user file recall', { timeout: 2000 }, async t => {
+  const originalSetTimeout = global.setTimeout
+  let expire, signalQuery
+  global.setTimeout = (fn, delay, ...args) => {
+    if (delay !== 3000) return originalSetTimeout(fn, delay, ...args)
+    expire = fn
+    return originalSetTimeout(() => {}, 10000)
+  }
+  t.after(() => { global.setTimeout = originalSetTimeout })
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
+  const started = new Promise(resolve => { signalQuery = resolve })
+  f.session.bot.internal = { getGroupMemberInfo() { signalQuery(); return new Promise(() => {}) } }
+  await f.command('')
+  const upload = f.hooks.message(f.session)
+  await started
+  await upload
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC', 'analysis must start before permission lookup finishes')
+  assert.equal(typeof expire, 'function')
+  expire()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(f.deleted.map(row => row.messageId), ['message-1'])
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.ok(f.logs.some(entry => entry.level === 'warn' && entry.args.includes('查询机器人群管理权限超时。')))
 })
 
 test('file recall denied by the platform does not interrupt initial or appended submissions', async t => {
-  const f = await fixture(t)
-  f.session.messageId = 'initial-file'
+  const f = await fixture(t, { group_whitelist: ['group'] })
+  Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false, messageId: 'initial-file' })
   f.session.bot.deleteMessage = async (channelId, messageId) => {
     f.deleted.push({ channelId, messageId })
     throw new Error('permission denied')
@@ -357,7 +455,8 @@ for (const stage of ['prompt', 'initial-file', 'appended-file']) {
       if (!timers.delete(handle)) originalClearTimeout(handle)
     }
     t.after(() => { global.setTimeout = originalSetTimeout; global.clearTimeout = originalClearTimeout })
-    const f = await fixture(t)
+    const f = await fixture(t, { group_whitelist: ['group'] })
+    Object.assign(f.session, { channelId: 'group', guildId: 'group', isDirect: false })
     await f.command('')
     if (stage === 'appended-file') await f.hooks.message(f.session)
     f.session.messageId = stage === 'prompt' ? undefined : stage
@@ -374,10 +473,12 @@ for (const stage of ['prompt', 'initial-file', 'appended-file']) {
     }
     const upload = f.hooks.message(f.session)
     await started
+    await upload
+    assert.equal(f.database.rows[0].status, 'WAITING_NPC', 'recall must not delay diagnostic processing')
     assert.equal(timers.size, 1, 'the stuck recall must have a timeout')
     const expire = [...timers.values()][0]
     expire()
-    await upload
+    await new Promise(resolve => setImmediate(resolve))
     assert.equal(timers.size, 0, 'the timeout timer must be cleaned up')
     assert.equal(f.calls.issues.length, 1)
     assert.equal(f.database.rows[0].status, 'WAITING_NPC')
@@ -391,6 +492,93 @@ for (const stage of ['prompt', 'initial-file', 'appended-file']) {
     assert.equal(f.database.rows[0].status, 'WAITING_NPC')
   })
 }
+
+test('a delivered receipt without an adapter response does not block file submission', { timeout: 2000 }, async t => {
+  const originalSetTimeout = global.setTimeout
+  const originalClearTimeout = global.clearTimeout
+  const timers = new Map()
+  global.setTimeout = (fn, delay, ...args) => {
+    if (delay !== 5000) return originalSetTimeout(fn, delay, ...args)
+    const handle = {}
+    timers.set(handle, fn)
+    return handle
+  }
+  global.clearTimeout = handle => {
+    if (!timers.delete(handle)) originalClearTimeout(handle)
+  }
+  t.after(() => { global.setTimeout = originalSetTimeout; global.clearTimeout = originalClearTimeout })
+  const f = await fixture(t)
+  await f.command('')
+  const originalSend = f.session.send
+  f.session.send = message => message === '正在提交日志…' ? new Promise(() => {}) : originalSend(message)
+  await f.hooks.message(f.session)
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.equal(f.calls.issues.length, 1)
+  assert.equal(f.calls.comments.length, 1)
+  assert.equal(timers.size, 1)
+  for (const expire of timers.values()) expire()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(timers.size, 0)
+  assert.ok(f.logs.some(entry => entry.level === 'warn' && /日志接收回执失败/.test(entry.args[0])))
+})
+
+test('a 16.31 MiB file passes streamed HTTP download and upload before requesting analysis', async t => {
+  const http = require('node:http')
+  const { createReadStream } = require('node:fs')
+  const { createHash } = require('node:crypto')
+  const realUpload = CNBClient.prototype.uploadAttachment
+  const realFetch = global.fetch
+  const realRequest = http.request
+  const f = await fixture(t)
+  const bytes = Buffer.alloc(Math.floor(16.31 * 1024 * 1024), 0x5a)
+  const expectedHash = createHash('sha256').update(bytes).digest('hex')
+  await fs.writeFile(f.source, bytes)
+  let uploadedSize = 0, uploadedHash, downloads = 0
+  const server = http.createServer(async (request, response) => {
+    if (request.method === 'GET') {
+      downloads++
+      response.writeHead(200, { 'Content-Length': String(bytes.length), 'Content-Type': 'application/zip' })
+      createReadStream(f.source).pipe(response)
+      return
+    }
+    const hash = createHash('sha256')
+    for await (const chunk of request) { uploadedSize += chunk.length; hash.update(chunk) }
+    uploadedHash = hash.digest('hex')
+    response.writeHead(201)
+    response.end()
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const baseUrl = `http://127.0.0.1:${server.address().port}`
+  t.after(async () => {
+    global.fetch = realFetch
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  })
+  // Keep production URL validation intact; route only this test's socket to its local HTTP server.
+  t.mock.method(http, 'request', (url, options, callback) => {
+    assert.equal(url.hostname, '8.8.8.8')
+    return realRequest(`${baseUrl}/download`, { ...options, lookup: undefined }, callback)
+  })
+  global.fetch = async (url, options) => {
+    if (options.method === 'POST') return new Response(JSON.stringify({ file_upload_urls: [{
+      upload_url: 'https://uploads.example.test/log', asset_link: '[diagnostic.zip](https://cnb.cool/asset/large)',
+    }] }))
+    assert.equal(options.method, 'PUT')
+    assert.equal(options.headers['Content-Length'], String(bytes.length))
+    return realFetch(`${baseUrl}/upload`, options)
+  }
+  CNBClient.prototype.uploadAttachment = realUpload
+  f.session.elements[0].attrs = { name: 'diagnostic.zip', url: 'http://8.8.8.8/diagnostic.zip' }
+  await f.command('')
+  await f.hooks.message(f.session)
+  assert.equal(downloads, 1)
+  assert.equal(uploadedSize, bytes.length)
+  assert.equal(uploadedHash, expectedHash)
+  assert.equal(f.calls.issues.length, 1)
+  assert.equal(f.calls.comments.length, 1)
+  assert.equal(f.database.rows[0].status, 'WAITING_NPC')
+  assert.match(f.calls.issues[0].body, new RegExp(`${bytes.length} 字节`))
+})
 
 test('keep user files when initial Issue creation fails even after a successful upload', async t => {
   const f = await fixture(t)
